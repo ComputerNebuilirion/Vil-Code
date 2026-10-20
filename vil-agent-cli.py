@@ -24,6 +24,7 @@
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,9 @@ from VilAgent.agent_app import (
     SESSIONS_DIR as _SESSIONS_DIR,
     console as _console,
 )
+from VilAgent.session import truncate_display as _trunc
+from VilAgent.session import clean_title, title_from_messages
+from VilAgent.loop import retitle_sessions
 from VilAgent.i18n import t, set_lang
 
 
@@ -113,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("session", help=t("会话 ID", "session ID"))
     ex.add_argument("-o", "--out", help=t("输出文件路径（默认 session_<id>.md）",
                                          "output file path (default session_<id>.md)"))
+    rt = hsub.add_parser("retitle", help=t("批量重生成会话标题（老标题一次性迁移）",
+                                           "regenerate session titles (one-off migration)"))
+    rt.add_argument("session", nargs="?", help=t("只处理该会话 ID（前缀匹配，缺省=全部）",
+                                                 "only this session ID (prefix match; default: all)"))
+    rt.add_argument("-n", "--dry-run", action="store_true",
+                    help=t("只打印结果不写盘", "print results without writing"))
+    rt.add_argument("--local", action="store_true",
+                    help=t("只用本地规则，不调 LLM（省 token，质量略低）",
+                           "local rules only, no LLM call (cheaper, lower quality)"))
 
     # config
     pc = sub.add_parser("config", help=t("全局配置管理", "global config management"))
@@ -166,8 +179,8 @@ async def run_agent(args: argparse.Namespace) -> None:
                                f"[session] session {sid} not found"))
         # 续接时以当前子命令的 mode 为准（允许 do 续接为 ask 等切换）
         sm.update(sid, status="active", mode=mode)
-        _console.print(t(f"[dim]\\[session] 续接 {sid}[/dim]",
-                         f"[dim]\\[session] resumed {sid}[/dim]"))
+        _console.print(t(f"[dim]\\[session] 续接 {sm.label_of(sid)}[/dim]",
+                         f"[dim]\\[session] resumed {sm.label_of(sid)}[/dim]"))
     elif force_new:
         # 显式 --new
         sid = sm.create(mode=mode, task=task)
@@ -179,8 +192,8 @@ async def run_agent(args: argparse.Namespace) -> None:
         if last_sid and sm.get(last_sid):
             sid = last_sid
             sm.update(sid, status="active", mode=mode)
-            _console.print(t(f"[dim]\\[session] 续接上次 {sid}[/dim]",
-                             f"[dim]\\[session] resumed last {sid}[/dim]"))
+            _console.print(t(f"[dim]\\[session] 续接上次 {sm.label_of(sid)}[/dim]",
+                             f"[dim]\\[session] resumed last {sm.label_of(sid)}[/dim]"))
         else:
             sid = sm.create(mode=mode, task=task)
             _console.print(t(f"[dim]\\[session] 新建 {sid}[/dim]",
@@ -234,6 +247,9 @@ def cmd_history(args: argparse.Namespace) -> int:
     sm = SessionManager(_SESSIONS_DIR)
     action = args.action
 
+    if action == "retitle":
+        return cmd_history_retitle(args)
+
     if action == "list":
         return _history_list(sm, limit=50)
 
@@ -250,7 +266,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             return 1
         state = State(sm.path_for(sid))
         msgs = state.load()
-        print(f"=== session {sid} (mode={meta.get('mode')}, "
+        print(f"=== session {sm.label_of(sid, short=0)} (mode={meta.get('mode')}, "
               f"steps={meta.get('steps_total', 0)}, "
               f"tokens={meta.get('tokens_total', 0)}) ===")
         print(f"task: {meta.get('task', '')}")
@@ -274,8 +290,9 @@ def cmd_history(args: argparse.Namespace) -> int:
             if not sid:
                 print(t("[history] (空)", "[history] (empty)"))
                 return 0
+        label = sm.label_of(sid, short=6)
         if sm.delete(sid):
-            print(t(f"[history] 已删除会话 {sid}", f"[history] deleted session {sid}"))
+            print(t(f"[history] 已删除会话 {label}", f"[history] deleted session {label}"))
             return 0
         print(t(f"[history] 会话 {sid} 不存在", f"[history] session {sid} not found"))
         return 1
@@ -291,7 +308,8 @@ def cmd_history(args: argparse.Namespace) -> int:
         md = sm.export_markdown(sid, msgs)
         out = args.out or f"session_{sid}.md"
         Path(out).write_text(md, encoding="utf-8")
-        print(t(f"[history] 已导出 {out}", f"[history] exported to {out}"))
+        print(t(f"[history] 已导出 {out}（{sm.label_of(sid, short=6)}）",
+                 f"[history] exported to {out} ({sm.label_of(sid, short=6)})"))
         return 0
 
     return 1
@@ -302,17 +320,106 @@ def _history_list(sm: SessionManager, limit: int = 20) -> int:
     if not items:
         print(t("[history] (空)", "[history] (empty)"))
         return 0
+    sm.ensure_titles()  # 历史遗留会话本地兜底补标题（不调 LLM）
+    items = sm.list_all()
+    budget = max(16, shutil.get_terminal_size((80, 24)).columns - 60)
     print(f"{'ID':<14} {'MODE':<8} {'STEPS':<6} {'TOKENS':<8} "
-          f"{'UPDATED':<17} {'TASK'}")
+          f"{'UPDATED':<17} {'TITLE'}")
     for it in items[:limit]:
-        task = (it.get("task") or "")[:50]
+        title = _trunc(it.get("title") or it.get("task") or "", budget)
         print(f"{it['id']:<14} {it.get('mode', '?'):<8} "
               f"{it.get('steps_total', 0):<6} "
               f"{it.get('tokens_total', 0):<8} "
               f"{_fmt_time(it.get('last_active_at', 0)):<17} "
-              f"{task}")
+              f"{title}")
     print(t(f"[history] 共 {len(items)} 个会话，显示最近 {min(limit, len(items))} 个",
              f"[history] {len(items)} sessions, showing the latest {min(limit, len(items))}"))
+    return 0
+
+
+def _title_row(idx: int, total: int, sm: SessionManager, row: dict) -> None:
+    """打印单条标题迁移结果：`旧 -> 新`（`~` 表示有变化）"""
+    head = f"  [{idx}/{total}] {row['id'][:8]}"
+    if row.get("error"):
+        print(t(f"{head} 失败: {row['error']}", f"{head} failed: {row['error']}"))
+    elif not row.get("new"):
+        print(t(f"{head} 跳过（无可读对话）", f"{head} skipped (no readable messages)"))
+    else:
+        flag = "~" if row["changed"] else "="
+        print(f"{head} {flag} {row['old'] or '-'} -> {row['new']}")
+
+
+def _title_summary(rows: list[dict], dry_run: bool) -> None:
+    changed = sum(1 for r in rows if r["changed"])
+    skipped = sum(1 for r in rows if not r.get("new"))
+    failed = sum(1 for r in rows if r.get("error"))
+    tail = t("（dry-run，未写盘）", " (dry-run, nothing written)") if dry_run else ""
+    print(t(f"[title] 共 {len(rows)} 个会话：{changed} 个更新，{skipped} 个跳过，"
+            f"{failed} 个失败{tail}",
+            f"[title] {len(rows)} sessions: {changed} updated, {skipped} skipped, "
+            f"{failed} failed{tail}"))
+
+
+def cmd_history_retitle(args: argparse.Namespace) -> int:
+    """批量重生成会话标题：把老的「硬截断」标题迁移成完整词组。
+
+    默认逐会话调 LLM；`--local` 只走本地规则（不烧 token）；
+    `--dry-run` 只打印不写盘。单个会话失败只跳过它。
+    """
+    sm = SessionManager(_SESSIONS_DIR)
+    items = sm.list_all()
+    want = (args.session or "").strip()
+    if want:
+        items = [it for it in items if it["id"].startswith(want)]
+        if not items:
+            print(t(f"[title] 会话 {want} 不存在", f"[title] session {want} not found"))
+            return 1
+    if not items:
+        print(t("[title] (空)", "[title] (empty)"))
+        return 0
+
+    total = len(items)
+    if args.local:
+        rows = []
+        for idx, it in enumerate(items, 1):
+            sid = it["id"]
+            msgs = sm.load_messages(sid, limit=12)
+            old = clean_title(it.get("title", "")) or title_from_messages(
+                msgs, it.get("task", ""))
+            new = title_from_messages(msgs, it.get("task", ""))
+            row = {"id": sid, "old": old, "new": new or "", "error": "",
+                   "changed": bool(new and new != old)}
+            if new and row["changed"] and not args.dry_run:
+                sm.set_title(sid, new)
+            rows.append(row)
+            _title_row(idx, total, sm, row)
+        _title_summary(rows, args.dry_run)
+        return 0
+
+    # LLM 路径：没配 LLM 就没法生成，明确提示而不是静默给个糟糕标题
+    try:
+        model = AgentModel()
+    except SystemExit:
+        print(t("[title] 未配置 LLM；可改用 --local 走本地规则",
+                "[title] LLM not configured; use --local for local rules"))
+        return 1
+    model.ensure_loop()
+    done = [0]
+
+    def _on_result(row: dict) -> None:
+        done[0] += 1
+        _title_row(done[0], total, sm, row)
+
+    print(t(f"[title] 正在用 LLM 重生成 {total} 个会话的标题…",
+            f"[title] regenerating titles for {total} sessions with the LLM..."))
+    try:
+        rows = asyncio.run(retitle_sessions(model.llm, sm, dry_run=args.dry_run,
+                                            on_result=_on_result))
+    except KeyboardInterrupt:
+        print(t("\n[title] 已取消（已处理的会话已落盘）",
+                "\n[title] cancelled (finished sessions are saved)"), file=sys.stderr)
+        return 130
+    _title_summary(rows, args.dry_run)
     return 0
 
 

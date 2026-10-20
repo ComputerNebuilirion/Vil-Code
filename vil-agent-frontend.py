@@ -31,6 +31,8 @@ import time
 from pathlib import Path
 
 from VilAgent import SessionManager, State
+from VilAgent.session import truncate_display as _trunc
+from VilAgent.loop import retitle_sessions
 from VilAgent.agent_app import (
     AgentModel, TerminalView,
     SESSIONS_DIR, console as _console,
@@ -70,6 +72,8 @@ REPL 命令:
   /deleteall             永久删除所有会话（需确认）
   /mode \\[ask|do|review]  查看/切换默认 mode
   /tokens                显示当前会话累计 token
+  /title \\[force]         用 LLM 生成/重生成当前会话标题（/sessions 里显示）
+  /title all [--dry-run]  批量重生成所有会话标题（老标题一次性迁移；dry-run 只预览）
   /compress \\[all]        调 LLM 压缩当前会话旧历史（all=强制重生成，
                          默认只压缩新增部分，保留最近 10 条原文）
 配置命令:
@@ -99,6 +103,10 @@ Session commands:
   /deleteall             permanently delete all sessions (confirmation required)
   /mode \\[ask|do|review]  view / switch the default mode
   /tokens                show cumulative tokens of the current session
+  /title \\[force]         generate/regenerate a title for the current session
+                         (shown by /sessions)
+  /title all [--dry-run] regenerate titles for all sessions (one-off migration;
+                         --dry-run only previews)
   /compress \\[all]         LLM-compress old history of the current session (all=force
                          regenerate; default compresses only new parts, keeps last 10)
 Config commands:
@@ -160,21 +168,82 @@ def _cmd_sessions(sm: SessionManager) -> None:
     if not items:
         _console.print(t(f"{_tag('history')} (空)", f"{_tag('history')} (empty)"))
         return
+    # 历史遗留会话没有 title → 本地兜底补一次（不调 LLM，只读 jsonl），
+    # 让每行都有可辨识的标题，而不是「(交互式会话)」
+    sm.ensure_titles()
+    items = sm.list_all()
+    # 标题列按控制台剩余宽度动态截断（前面固定 59 列），避免整行折行
+    budget = max(16, getattr(_console, "width", 80) - 60)
     _console.print(f"{'ID':<14} {'MODE':<8} {'STEPS':<6} {'TOKENS':<8} "
-                   f"{'UPDATED':<17} {'TASK'}")
+                   f"{'UPDATED':<17} {'TITLE'}")
     for it in items[:20]:
-        task = (it.get("task") or "")[:50]
+        title = (it.get("title") or "").strip()
+        if not title:
+            title = (it.get("task") or "").strip()
+        title = _trunc(title, budget)
         ts = it.get("last_active_at", 0)
         updated = (time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
                    if ts else "?")
+        mark = "*" if it["id"] == sm.get_current() else " "
         _console.print(f"{it['id']:<14} {it.get('mode','?'):<8} "
                        f"{it.get('steps_total',0):<6} "
                        f"{it.get('tokens_total',0):<8} "
-                       f"{updated:<17} {task}")
+                       f"{updated:<17} {mark}{title}")
     _console.print(t(f"{_tag('history')} 共 {len(items)} 个会话，显示最近 "
-                     f"{min(20, len(items))} 个",
+                     f"{min(20, len(items))} 个（* = 当前会话）",
                      f"{_tag('history')} {len(items)} sessions, showing latest "
-                     f"{min(20, len(items))}"))
+                     f"{min(20, len(items))} (* = current)"))
+
+
+def _cmd_title_all(model: AgentModel, sm: SessionManager,
+                   dry_run: bool = False) -> None:
+    """批量重生成所有会话的标题（老标题一次性迁移到新的「完整词组」规则）。
+
+    分批逐个调 LLM（每个会话 1 次），边算边打印「旧 → 新」；
+    单个会话失败只跳过它，不影响其余会话。
+    """
+    items = sm.list_all()
+    if not items:
+        _console.print(t(f"{_tag('history')} (空)", f"{_tag('history')} (empty)"))
+        return
+    total = len(items)
+    done = [0]
+
+    def _on_result(row: dict) -> None:
+        done[0] += 1
+        head = f"  [{done[0]}/{total}] {row['id'][:8]}"
+        if row["error"]:
+            _console.print(t(f"{head} 失败: {row['error']}",
+                             f"{head} failed: {row['error']}"))
+        elif not row["new"]:
+            _console.print(t(f"{head} 跳过（无可读对话）",
+                             f"{head} skipped (no readable messages)"))
+        else:
+            style = "green" if row["changed"] else "dim"
+            _console.print(
+                f"{head} [dim]{escape(row['old'] or '-')}[/dim] → "
+                f"[{style}]{escape(row['new'])}[/{style}]")
+
+    model.ensure_loop()
+    _console.print(t(f"{_tag('session')} 正在用 LLM 重生成 {total} 个会话的标题…",
+                     f"{_tag('session')} regenerating titles for {total} sessions "
+                     f"with the LLM..."))
+    try:
+        rows = asyncio.run(retitle_sessions(model.llm, sm, dry_run=dry_run,
+                                            on_result=_on_result))
+    except KeyboardInterrupt:
+        _console.print(t(f"{_tag('interrupt')} 已取消（已处理的会话已落盘）",
+                         f"{_tag('interrupt')} cancelled (finished sessions are saved)"))
+        return
+    changed = sum(1 for r in rows if r["changed"])
+    skipped = sum(1 for r in rows if not r["new"])
+    failed = sum(1 for r in rows if r["error"])
+    tail = t("（dry-run，未写盘）", " (dry-run, nothing written)") if dry_run else ""
+    _console.print(t(
+        f"{_tag('session')} 共 {len(rows)} 个会话：{changed} 个更新，"
+        f"{skipped} 个跳过，{failed} 个失败{tail}",
+        f"{_tag('session')} {len(rows)} sessions: {changed} updated, "
+        f"{skipped} skipped, {failed} failed{tail}"))
 
 
 def _cmd_history(state: State, n: int = 20) -> None:
@@ -237,7 +306,8 @@ def _cmd_history(state: State, n: int = 20) -> None:
 
 def _cmd_tokens(sm: SessionManager, sid: str) -> None:
     meta = sm.get(sid) or {}
-    _console.print(f"{_tag('session')} {sid} tokens={meta.get('tokens_total', 0)} "
+    _console.print(f"{_tag('session')} {sm.label_of(sid)} "
+                   f"tokens={meta.get('tokens_total', 0)} "
                    f"steps={meta.get('steps_total', 0)} "
                    f"status={meta.get('status', '?')}")
 
@@ -390,6 +460,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
     while True:
         # 提示符：[sid] (mode) >
         # 用 Rich markup（Rich 内部处理 Windows ANSI）
+        # 只放短 session ID：稳定、窄、不随标题长度抖动
         mode_style = {"ask": "bold green", "do": "bold red",
                       "review": "bold blue"}.get(default_mode, "bold green")
         prompt = (
@@ -430,6 +501,47 @@ def repl_loop(model: AgentModel, view: TerminalView,
             continue
         if line == "/tokens":
             _cmd_tokens(sm, sid)
+            continue
+        if line == "/title" or line.startswith("/title "):
+            # 手动生成标题：/title 缺标题时生成，/title force 强制重生成
+            # /title all 批量重生成所有会话（老标题一次性迁移），--dry-run 只预览
+            parts = line.split()[1:]
+            flags = {p for p in parts if p.startswith("-") or p == "all"}
+            batch = bool(flags & {"all", "--all", "-a"})
+            if batch:
+                try:
+                    _cmd_title_all(model, sm,
+                                   dry_run=bool(flags & {"--dry-run", "-n"}))
+                except Exception as e:
+                    _console.print(t(f"{_tag('error')} 批量生成标题失败: {e}",
+                                     f"{_tag('error')} batch title generation failed: {e}"))
+                continue
+            force_title = bool(parts)
+            agent = model.build_agent(
+                mode="ask", trust=False, stream=False, max_steps=1,
+                permission_handler=None, state=state,
+                session_id=sid, session_manager=sm,
+            )
+            _console.print(t(f"{_tag('session')} 正在用 LLM 生成会话标题…",
+                             f"{_tag('session')} generating session title with the LLM..."))
+            try:
+                model.ensure_loop()
+                new_title = asyncio.run(agent.generate_title(force=force_title))
+            except KeyboardInterrupt:
+                _console.print(t(f"{_tag('interrupt')} 已取消",
+                                 f"{_tag('interrupt')} cancelled"))
+                continue
+            except Exception as e:
+                _console.print(t(f"{_tag('error')} 生成标题失败: {e}",
+                                 f"{_tag('error')} title generation failed: {e}"))
+                continue
+            if new_title:
+                _console.print(t(f"{_tag('session')} 标题已更新: {new_title}",
+                                 f"{_tag('session')} title updated: {new_title}"))
+            else:
+                _console.print(
+                    t(f"{_tag('session')} 已有标题（用 /title force 重新生成）",
+                      f"{_tag('session')} title already set (use /title force to regenerate)"))
             continue
         if line == "/compress" or line.startswith("/compress "):
             # 手动摘要压缩：调 LLM 把当前会话旧历史压成摘要缓存。
@@ -478,10 +590,11 @@ def repl_loop(model: AgentModel, view: TerminalView,
             continue
         if line == "/clear":
             meta = sm.get(sid) or {}
+            label = sm.label_of(sid, short=6)
             if not _confirm_dangerous(
-                    t(f"清空会话 {sid[:6]} 的历史（{meta.get('steps_total', 0)} 步、"
+                    t(f"清空会话 {label} 的历史（{meta.get('steps_total', 0)} 步、"
                       f"{meta.get('tokens_total', 0)} tokens 将丢失）",
-                      f"clear the history of session {sid[:6]} "
+                      f"clear the history of session {label} "
                       f"({meta.get('steps_total', 0)} steps, "
                       f"{meta.get('tokens_total', 0)} tokens will be lost)")):
                 _console.print(t("[dim]已取消[/dim]", "[dim]cancelled[/dim]"))
@@ -489,8 +602,8 @@ def repl_loop(model: AgentModel, view: TerminalView,
             state.clear()
             sm.update(sid, tokens_total=0, steps_total=0,
                       summary="", status="active")
-            _console.print(t(f"{_tag('session')} 已清空 {sid[:6]}",
-                             f"{_tag('session')} cleared {sid[:6]}"))
+            _console.print(t(f"{_tag('session')} 已清空 {label}",
+                             f"{_tag('session')} cleared {label}"))
             continue
         if line == "/deleteall" or line.startswith("/deleteall "):
             # 删除所有会话（mc 风格二次确认）
@@ -529,24 +642,27 @@ def repl_loop(model: AgentModel, view: TerminalView,
                 else:
                     _console.print(
                         t(f"{_tag('error')} 匹配多个会话: "
-                          f"{' / '.join(m[:6] for m in matches)}，请输更长的前缀",
+                          f"{' / '.join(sm.label_of(m, short=6) for m in matches)}"
+                          f"，请输更长的前缀",
                           f"{_tag('error')} matches multiple sessions: "
-                          f"{' / '.join(m[:6] for m in matches)}, please type a longer prefix")
+                          f"{' / '.join(sm.label_of(m, short=6) for m in matches)}"
+                          f", please type a longer prefix")
                     )
                     continue
             meta = sm.get(target_sid) or {}
-            desc = t(f"删除会话 {target_sid[:6]}（{meta.get('mode', '?')} 模式、"
+            target_label = sm.label_of(target_sid, short=6)
+            desc = t(f"删除会话 {target_label}（{meta.get('mode', '?')} 模式、"
                      f"{meta.get('steps_total', 0)} 步、"
                      f"{meta.get('tokens_total', 0)} tokens，将连同文件一并删除）",
-                     f"delete session {target_sid[:6]} ({meta.get('mode', '?')} mode, "
+                     f"delete session {target_label} ({meta.get('mode', '?')} mode, "
                      f"{meta.get('steps_total', 0)} steps, "
                      f"{meta.get('tokens_total', 0)} tokens; its files will be removed too)")
             if not _confirm_dangerous(desc):
                 _console.print(t("[dim]已取消[/dim]", "[dim]cancelled[/dim]"))
                 continue
             if sm.delete(target_sid):
-                _console.print(t(f"{_tag('session')} 已删除会话 {target_sid[:6]}",
-                                 f"{_tag('session')} deleted session {target_sid[:6]}"))
+                _console.print(t(f"{_tag('session')} 已删除会话 {target_label}",
+                                 f"{_tag('session')} deleted session {target_label}"))
                 if target_sid == sid:
                     # 删的就是当前 session → 切回上次活跃的，没有就开新
                     prev_sid = sm.last_session_id()
@@ -557,11 +673,12 @@ def repl_loop(model: AgentModel, view: TerminalView,
                         sm.set_current(sid)
                         meta = sm.get(sid) or {}
                         _console.print(
-                            t(f"{_tag('session')} 已切回上次会话 {sid[:6]} · "
+                            t(f"{_tag('session')} 已切回上次会话 {sm.label_of(sid, short=6)} · "
                               f"{meta.get('mode', '?')} 模式 · "
                               f"{meta.get('steps_total', 0)} 步累计 · "
                               f"{meta.get('tokens_total', 0)} tokens",
-                              f"{_tag('session')} switched back to last session {sid[:6]} · "
+                              f"{_tag('session')} switched back to last session "
+                              f"{sm.label_of(sid, short=6)} · "
                               f"{meta.get('mode', '?')} mode · "
                               f"{meta.get('steps_total', 0)} steps total · "
                               f"{meta.get('tokens_total', 0)} tokens")
@@ -615,15 +732,18 @@ def repl_loop(model: AgentModel, view: TerminalView,
                 else:
                     _console.print(
                         t(f"{_tag('error')} 匹配多个会话: "
-                          f"{' / '.join(m for m in matches)}，请输更长的前缀",
+                          f"{' / '.join(sm.label_of(m, short=6) for m in matches)}"
+                          f"，请输更长的前缀",
                           f"{_tag('error')} matches multiple sessions: "
-                          f"{' / '.join(m for m in matches)}, please type a longer prefix")
+                          f"{' / '.join(sm.label_of(m, short=6) for m in matches)}"
+                          f", please type a longer prefix")
                     )
                     continue
             sid = new_sid
             state = State(sm.path_for(sid))
             sm.set_current(sid)
-            _console.print(t(f"{_tag('session')} 切换到 {sid}", f"{_tag('session')} switched to {sid}"))
+            _console.print(t(f"{_tag('session')} 切换到 {sm.label_of(sid)}",
+                             f"{_tag('session')} switched to {sm.label_of(sid)}"))
             continue
         if line.startswith("/"):
             _console.print(t(f"{_tag('error')} 未知命令: {line}（/help 查看可用命令）",
@@ -746,6 +866,18 @@ def repl_loop(model: AgentModel, view: TerminalView,
             # 兜底：任何出口（done / 中断 / 异常 / 连按两次 Ctrl+C）都复位
             # spinner + Live，防止 rich Status 渲染线程泄漏让终端卡住
             view.stop_all()
+
+        # 会话标题：本轮已有真实对话，缺标题时用 LLM 生成一次（失败静默降级）
+        try:
+            model.ensure_loop()
+            title = asyncio.run(agent.generate_title())
+            if title:
+                _console.print(t(f"[dim]{_tag('session')} 会话标题: {title}[/dim]",
+                                 f"[dim]{_tag('session')} session title: {title}[/dim]"))
+        except KeyboardInterrupt:
+            pass  # 标题只是锦上添花，绝不打断 REPL
+        except Exception:
+            pass
 
 
 def run_frontend(args: argparse.Namespace) -> None:
@@ -907,14 +1039,22 @@ def _render_banner(console, sm, sid: str, resumed: bool, args) -> None:
         head = Text()
         head.append("  ↻ ", style="bold green")
         head.append(t("已恢复会话 ", "resumed session "), style="")
-        head.append(sid[:12], style="bold yellow")
+        title = sm.title_of(sid)
+        if title:
+            # 标题放主位（用户靠它辨认会话），短 ID 退成灰色括注
+            head.append(_trunc(title, 44), style="bold yellow")
+            head.append(f" ({sid[:12]})", style="dim")
+        else:
+            head.append(sid[:12], style="bold yellow")
         head.append("  ·  ", style="dim")
         head.append(t(f"{steps} 步", f"{steps} steps"), style="")
         head.append("  ·  ", style="dim")
         head.append(f"{tokens:,} tokens", style="")
         console.print(head)
 
-        if task_preview:
+        if task_preview and task_preview != title and \
+                task_preview not in ("(交互式会话)", "(interactive session)",
+                                     "(新会话)", "(new session)"):
             task_line = Text()
             task_line.append(t("    ↳ 上次任务: ", "    ↳ last task: "), style="dim")
             task_line.append(task_preview, style="italic")

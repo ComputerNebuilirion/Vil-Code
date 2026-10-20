@@ -273,8 +273,20 @@ sessions/
 - `last_session_id() -> sid | None`：最近活跃的（按 `last_active_at` 倒序取首）
 - `cleanup_empty() -> int`：清理 jsonl 不存在或 size=0 的 session（启动时调用，删"启动后立刻 /exit"残留的空元数据）
 - `export_markdown(sid, messages) -> str`：导出 markdown
+- `set_title(sid, title) / title_of(sid) / ensure_titles(force=False)`：会话标题（见下）；`force=True` 用本地规则重算已有标题
+- `label_of(sid, short=12, title_width=40) -> str`：面向用户的会话标签 `ID · 标题`，无标题退化成纯 ID。**凡是把 session_id 打给用户看的地方（启动续接提示、REPL 提示符、`/switch`、`/delete` 确认、`history show`）都走它**，否则用户记不住 12 位 hex。
 
-元数据字段：`id / mode / task / created_at / last_active_at / tokens_total / steps_total / status(active|done) / summary / last_status(done|interrupted|loop_detected|max_steps)`。
+**会话标题**：`/sessions` 靠 `title` 字段辨识「这个会话是干嘛的」。REPL 建的会话 task 只是 `(交互式会话)` 这种占位符，无信息量，因此标题单独生成：
+
+1. 首轮 `agent.run()` 结束后，前端调 `AgentLoop.generate_title()` 用 LLM 把开场对话压成单行标题（`/title` 可手动触发，`/title force` 强制重生成）；已有标题则跳过，不重复烧 token。预算：中文 ≤15 字（汉字/英文词各计 1），英文 ≤20 词。
+2. LLM 不可用/报错时 `title_from_messages()` 本地兜底：取首条有效 user 消息（跳过占位 task）。**已有标题则保留旧标题**——批量重生成时 LLM 临时挂掉，不会拿本地粗推导覆盖原本更好的标题。
+3. 历史遗留的会话没有 `title`，`/sessions` 渲染前调 `ensure_titles()` 本地推导并落盘一次。
+4. **老标题批量迁移**：规则升级后旧标题（硬截断的半句话）需要重算——`/title all`（REPL）或 `vil-agent-cli history retitle`（CLI）逐会话调 LLM 重生成，`--dry-run` 预览、`--local` 只走本地规则不烧 token。实现是模块级 `retitle_sessions(llm, sm, only, dry_run, on_result)`，单个会话失败只跳过它。
+5. CLI 一次性运行用真实 task 直接当标题（省一次 LLM 调用）。
+6. `clean_title()` 统一归一化：压成单行、去首尾引号/`#*`、48 字硬截断兜底（`limit` 可关）。
+7. `fit_title()` 负责长度预算，且**只在词组边界收尾**：中文优先切在分句标点（`，。；！？`）处，英文优先切在从句连接词（`and`/`then`/`so`…）处，并剥掉切断后残留的尾部虚词（`的`/`并在`）与悬空英文词（`这个项目在 Linux` → `这个项目`）。另有显示宽度兜底（中文 ≤30 列、英文 ≤40 字符），防止「英文单词按 1 字计」让混排标题放得过长。目标是 `Linux平台兼容` 而不是 `审计代码，现在即将需要进行对Linux的兼容，写…`。
+
+元数据字段：`id / mode / task / created_at / last_active_at / tokens_total / steps_total / status(active|done) / summary / title / last_status(done|interrupted|loop_detected|max_steps)`。
 
 前端 REPL 命令（`vil-agent-frontend.py`）：
 
@@ -285,12 +297,14 @@ sessions/
 | `/delete [sid]` | `delete()`；删当前则 `last_session_id()` 切回上次活跃，没有就 `create()` 新建 |
 | `/deleteall` | `delete_all()` + 必须新建一个 session（当前也已被删） |
 | `/clear` | `state.clear()` + 元数据 `tokens_total/steps_total/summary` 归零 |
-| `/sessions` `/tokens` `/history` | 列表 / 显示累计 / 显示最近消息（彩色角色区分：USER/ASSISTANT/TOOL/SYSTEM） |
+| `/sessions` `/tokens` `/history` | 列表（含 ID/MODE/STEPS/TOKENS/UPDATED/**TITLE**，`*` 标当前会话）/ 显示累计 / 显示最近消息（彩色角色区分：USER/ASSISTANT/TOOL/SYSTEM） |
+| `/title [force]` | 用 LLM 生成/重生成当前会话标题（缺标题时自动生成，`force` 强制重生成） |
+| `/title all [--dry-run]` | 批量重生成所有会话标题（老标题一次性迁移），`--dry-run` 只预览不写盘 |
 | `/compress [all]` | 手动摘要压缩：调 LLM 把当前会话旧历史压成摘要缓存（保留最近 10 条原文），`all` 忽略缓存强制重生成；无需 `context_budget` 即可生效 |
 | `/export [sid] [-o f]` | `export_markdown()` 导出为 .md（默认当前会话，支持 `-o` 指定路径） |
 | `/config` | 修改 `~/.vil/config.json`（详见下文「配置」） |
 
-启动时 `cleanup_empty()` 自动清理空 session；**frontend 和 CLI 均默认续接上次会话**（`last_session_id()`），`--new` 强制新建，`--continue <sid|last>` 指定续接。CLI 通过 `history list/show/clear/export` 子命令管理会话。
+启动时 `cleanup_empty()` 自动清理空 session；**frontend 和 CLI 均默认续接上次会话**（`last_session_id()`），`--new` 强制新建，`--continue <sid|last>` 指定续接。CLI 通过 `history list/show/clear/export/retitle` 子命令管理会话（`retitle` 批量重生成标题：`--dry-run` 预览、`--local` 只用本地规则、可选 session ID 前缀只处理一个）。
 
 `<new_task/>` 检测：当 agent 判定当前输入与前面任务明显不相关时，在输出末尾打 `<new_task/>` 标记。`TerminalView` 渲染时静默过滤该标记；前端在 `stats` 事件后检测原始 `content` 是否含 `<new_task/>`，是则提示 `/new` 切换 session（显示当前累计步数/token）。
 

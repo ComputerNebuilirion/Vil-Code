@@ -12,7 +12,10 @@ from .safety import classify, classify_command
 from .safety.permissions import (
     PermissionSystem, default_rules_file, ALLOW, ASK, DENY,
 )
-from .session import SessionManager
+from .session import (
+    SessionManager, _TITLE_MAX_EN, _TITLE_MAX_ZH,
+    clean_title, fit_title, title_from_messages,
+)
 from .state import State
 from .tools import execute_tool, get_tool_schemas, tool_is_readonly
 
@@ -36,6 +39,123 @@ _MODE_PROMPT = {
     "do": "do",
     "review": "review",
 }
+
+
+async def generate_title_for(llm, session_manager: SessionManager, session_id: str,
+                             force: bool = False,
+                             max_zh: int = _TITLE_MAX_ZH,
+                             max_en: int = _TITLE_MAX_EN,
+                             dry_run: bool = False) -> str | None:
+    """给指定会话用 LLM 生成短标题（/sessions 靠它识别用途）。
+
+    抽成模块级函数是为了「批量迁移历史标题」能复用：批量场景没有 AgentLoop 实例
+    （不需要 State/Context/工具），只需 llm + session_manager + session_id。
+
+    :param force: 已有标题时是否重新生成（/title 命令用）
+    :param max_zh: 中文标题预算（汉字/英文词计 1 个单位）
+    :param max_en: 英文标题预算（按词计）
+    :param dry_run: 只算出标题不落盘（预览用）
+    LLM 失败不报错，退回本地推导（首条 user 消息），保证标题始终有值。
+    """
+    meta = session_manager.get(session_id) or {}
+    if not force and clean_title(meta.get("title", "")):
+        return None
+
+    msgs = session_manager.load_messages(session_id, limit=16)
+    lines = []
+    for m in msgs:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False)
+        text = " ".join(str(content or "").replace("<new_task/>", " ").split())
+        if text:
+            lines.append(f"[{m.get('role')}] {text[:300]}")
+    if not lines:
+        return None
+    # 标题看开头最有效：取前 10 段，长了再补末尾 3 段
+    sample = lines[:10] if len(lines) <= 13 else lines[:10] + ["..."] + lines[-3:]
+
+    if get_lang() == "en":
+        prompt = (
+            f"Give the conversation below a short title in English "
+            f"(at most {max_en} words, single line, no quotes, no period; "
+            f"avoid vague words like 'session'). "
+            f"It must be a noun phrase, not a half sentence and not a "
+            f"truncated clause — e.g. 'Linux platform compatibility', "
+            f"not 'Audit the code, now we are going to'. "
+            f"Output the title only.\n\n"
+            f"Conversation:\n" + "\n".join(sample)
+        )
+    else:
+        prompt = (
+            f"给下面这段对话起一个简短标题（不超过 {max_zh} 个字，"
+            f"英文单词按 1 个字算，单行，不要引号、不要句号，"
+            f"避免「会话/对话」这类空泛词）。"
+            f"标题必须是名词性短语、完整词组，不要写成半句话，"
+            f"例如「Linux平台兼容」而不是「审计代码，现在即将需要…」。"
+            f"只输出标题本身。\n\n对话：\n" + "\n".join(sample)
+        )
+
+    title = ""
+    try:
+        result = await llm.chat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        # 长度预算在此统一收口：模型不听话时裁到完整词组
+        title = fit_title((result or {}).get("content") or "",
+                          zh_budget=max_zh, en_budget=max_en)
+    except Exception:
+        title = ""  # 标题是锦上添花，失败绝不打断主流程
+    if not title:
+        # LLM 失败/空回复：已有标题就保留——不拿本地粗推导去覆盖原本更好的标题
+        title = clean_title(meta.get("title", "")) or title_from_messages(
+            msgs, meta.get("task", ""))
+    if not title:
+        return None
+    if dry_run:
+        return title
+    return session_manager.set_title(session_id, title) or None
+
+
+async def retitle_sessions(llm, session_manager: SessionManager, *,
+                           only: list[str] | None = None,
+                           dry_run: bool = False,
+                           max_zh: int = _TITLE_MAX_ZH,
+                           max_en: int = _TITLE_MAX_EN,
+                           on_result: Callable[[dict], None] | None = None,
+                           ) -> list[dict]:
+    """批量重生成会话标题（老标题一次性迁移到新的「完整词组」规则）。
+
+    每个会话：先记下旧标题（本身没标题则本地推导），再无条件调 LLM 重生成，
+    这样「旧的硬截断标题」也能一起修掉。
+
+    :param only: 只处理这些 session id（缺省=全部，按最近活跃倒序）
+    :param dry_run: 只计算不写盘，用于预览
+    :return: [{"id", "old", "new", "changed", "error"}]
+    """
+    rows: list[dict] = []
+    for meta in session_manager.list_all():
+        sid = meta.get("id")
+        if not sid or (only and sid not in only):
+            continue
+        old = clean_title(meta.get("title", "")) or title_from_messages(
+            session_manager.load_messages(sid, limit=12), meta.get("task", ""))
+        row = {"id": sid, "old": old, "new": "", "changed": False, "error": ""}
+        try:
+            new = await generate_title_for(
+                llm, session_manager, sid, force=True, dry_run=dry_run,
+                max_zh=max_zh, max_en=max_en)
+        except Exception as exc:  # 单个会话失败不影响其余会话
+            new, row["error"] = None, f"{type(exc).__name__}: {exc}"
+        row["new"] = new or ""
+        row["changed"] = bool(new and new != old)
+        rows.append(row)
+        if on_result:
+            on_result(row)
+    return rows
 
 
 class AgentLoop:
@@ -458,6 +578,20 @@ class AgentLoop:
             # 摘要失败静默降级：_build_messages 会回退到占位符压缩
             pass
         return None
+
+    async def generate_title(self, force: bool = False,
+                             max_zh: int = _TITLE_MAX_ZH,
+                             max_en: int = _TITLE_MAX_EN) -> str | None:
+        """用 LLM 给当前会话起个短标题并写入元数据（/sessions 靠它识别用途）。
+
+        :param force: 已有标题时是否重新生成（/title 命令用）
+        实现见模块级 generate_title_for()——批量迁移历史标题也复用它。
+        """
+        if not (self.session_manager and self.session_id):
+            return None
+        return await generate_title_for(
+            self.llm, self.session_manager, self.session_id,
+            force=force, max_zh=max_zh, max_en=max_en)
 
     async def _maybe_summarize(self, callback) -> None:
         """自动摘要：仅在 token 预算模式启用；无新增可压缩消息时跳过。
