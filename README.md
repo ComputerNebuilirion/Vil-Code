@@ -307,17 +307,24 @@ def my_tool(foo: str, _ctx=None) -> str:
 
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
   高危（`exec/eval/ctypes/win32*`）= 可逃逸沙箱，L3 直接拒；中等（网络/执行/写）= 放行进沙箱并交给 L2 决策。
+
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
+
   `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse`，以及 Linux 专属的 fork 炸弹 / `chmod -R 777 /` / `> /dev/sda` …）判 `high`，网络工具判 `medium`。
 - **L2 `PermissionSystem`** → 工具调用前决策 `allow/ask/deny`。
+  
   顺序：readonly 工具放行 → 内置 deny 硬底线（危险命令，**用户规则无法放行**）→ 用户规则命中 → 默认姿态。
+
   硬底线用 `match_dangerous_command()` 对命令做**规范化（小写+折叠空白）+ 正则 search**，可覆盖大小写（`RM -RF /`）、前缀（`sudo rm -rf /`）、拼接（`echo x && rm -rf /`）以及 Windows/PowerShell（`del`/`rd /s`/`format`/`Remove-Item -Recurse`）、Linux 专属（fork 炸弹 `:(){ :|:& };:`、根目录放开权限 `chmod -R 777 /`、裸块设备写入 `> /dev/sda`/`tee /dev/nvme0n1`）等绕过写法（`exec.py` 复用同一匹配器，避免两套口径不一致）。黑名单混合三类平台条目（Unix / Windows cmd / PowerShell），在各自平台上互为死代码但无害，不按平台分层以保持单一口径。
 
   **默认姿态（trust 模式 / do 模式）**：写/编辑类工具（`write_file`/`edit_file`）自动 **allow**（低摩擦，自动化友好）；命令/代码执行类（`run_command`/`run_python`）**ask** 人工确认；破坏性工具（`delete_file`）因删除不可逆，亦单独 **ask**；`risk=high` 亦 **ask**。非 trust 模式写/执行一律 **deny**。
 
   **规则文件**（自动加载，无需传参）：优先 `<workspace>/.vil/permissions.json`，其次 `~/.vil/permissions.json`（`permissions_file` 传空串/None 均走此默认解析）；文件损坏时记录告警（`permission_warning` 事件）并忽略，不阻断循环。
+
   格式：`{"rules":[{"tool":"run_command","pattern":"git *","action":"allow"}]}`，fnmatch 对 `args["path"]` / `args["command"]` / `args["code"]` **逐个匹配，命中任一即算**。
+  
   例：`{"tool":"run_command","action":"allow"}`（省略 `pattern`）可把该工具所有调用整体放行（充分自动化）；`{"tool":"write_file","pattern":"src/**","action":"deny"}` 可反向收紧。
+  
   `action="ask"` 时调用 `permission_handler`（由调用方提供，如 CLI 交互输入）。
 - **L3 `sandbox_run(code, timeout, mem_mb, cwd)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
   - **Windows（有 pywin32）**：Job Object 限制内存/CPU/UI，超时用 `TerminateJobObject` 杀整个 Job（含后代）。
