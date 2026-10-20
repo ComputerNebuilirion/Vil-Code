@@ -73,7 +73,12 @@ class LLMClient:
         )
 
     async def aclose(self):
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except RuntimeError:
+            # transport 绑在别的事件循环上（跨 loop 关闭）时无法优雅关闭；
+            # 连接由 GC / OS 回收，不让退出流程因清理失败而报错
+            pass
 
     def recreate_client(self):
         """重建 httpx AsyncClient（跨 asyncio.run() 事件循环时使用）"""

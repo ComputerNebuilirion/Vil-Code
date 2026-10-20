@@ -46,9 +46,67 @@ from VilAgent.config import (
     CONFIG_FILE, load_config, set_value, get_value,
 )
 from VilAgent.i18n import t, set_lang, get_lang
+from VilAgent.input_line import read_line
+
+
+# —— 常驻事件循环 ——
+# 前端要跨很多轮调用协程（每轮 agent.run / title / compress 等）。
+# 若每处都用 asyncio.run()，每次都会新建并关闭一个 loop，而 httpx.AsyncClient
+# 的 transport 绑定在首次使用的 loop 上 —— 后续 loop 里复用会抛
+# "Event loop is closed"，且退出时 model.close() 也在新 loop 里关旧 loop 的连接，
+# 必然失败。这里整个进程共用一个 loop，彻底绕开该问题。
+_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    """惰性创建进程级常驻事件循环。"""
+    global _LOOP
+    if _LOOP is None or _LOOP.is_closed():
+        _LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_LOOP)
+    return _LOOP
+
+
+def _run(coro):
+    """在常驻 loop 上执行协程，语义对齐 asyncio.run()（但不关闭 loop）。
+
+    Ctrl+C 时取消任务并让取消清理流程跑完，再向上抛 KeyboardInterrupt，
+    避免中断后任务残留在 loop 上。
+    """
+    loop = _get_loop()
+    task = loop.create_task(coro)
+    try:
+        return loop.run_until_complete(task)
+    except KeyboardInterrupt:
+        task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except BaseException:
+            pass
+        raise
+
+
+def _close_loop() -> None:
+    """退出时收尾：跑完 asyncgen 清理再关闭常驻 loop。"""
+    global _LOOP
+    if _LOOP is not None and not _LOOP.is_closed():
+        try:
+            _LOOP.run_until_complete(_LOOP.shutdown_asyncgens())
+        except Exception:
+            pass
+        _LOOP.close()
+    _LOOP = None
+
 
 # 写类模式：trust=True
 _WRITE_MODES = {"do"}
+
+# 输入行：跨平台可编辑（prompt_toolkit > readline > console.input）。
+# 不用 console.input() 的四个原因见 VilAgent/input_line.py 的模块 docstring。
+def _read_input(prompt_markup: str) -> str:
+    """读一行用户输入；EOFError / KeyboardInterrupt 原样抛给调用方。"""
+    return read_line(prompt_markup, _console)
+
 
 def _help_text() -> str:
     """按当前语言返回 REPL 帮助文本。"""
@@ -229,8 +287,8 @@ def _cmd_title_all(model: AgentModel, sm: SessionManager,
                      f"{_tag('session')} regenerating titles for {total} sessions "
                      f"with the LLM..."))
     try:
-        rows = asyncio.run(retitle_sessions(model.llm, sm, dry_run=dry_run,
-                                            on_result=_on_result))
+        rows = _run(retitle_sessions(model.llm, sm, dry_run=dry_run,
+                                     on_result=_on_result))
     except KeyboardInterrupt:
         _console.print(t(f"{_tag('interrupt')} 已取消（已处理的会话已落盘）",
                          f"{_tag('interrupt')} cancelled (finished sessions are saved)"))
@@ -443,7 +501,7 @@ def _confirm_dangerous(action_desc: str) -> bool:
           f"This cannot be undone! (a really long time!)[/bold red]")
     )
     try:
-        ans = input(t("  确认？[y/N] > ", "  Confirm? [y/N] > ")).strip().lower()
+        ans = _read_input(t("  确认？[y/N] > ", "  Confirm? [y/N] > ")).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     return ans in ("y", "yes", "是")
@@ -470,7 +528,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
             f"[bold bright_black]>[/bold bright_black] "
         )
         try:
-            line = _console.input(prompt)
+            line = _read_input(prompt)
         except (EOFError, KeyboardInterrupt):
             _console.print()
             _console.print(t(f"{_tag('interrupt')} 已返回提示符",
@@ -526,7 +584,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
                              f"{_tag('session')} generating session title with the LLM..."))
             try:
                 model.ensure_loop()
-                new_title = asyncio.run(agent.generate_title(force=force_title))
+                new_title = _run(agent.generate_title(force=force_title))
             except KeyboardInterrupt:
                 _console.print(t(f"{_tag('interrupt')} 已取消",
                                  f"{_tag('interrupt')} cancelled"))
@@ -558,7 +616,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
                              f"{_tag('session')} compressing current session history with the LLM..."))
             try:
                 model.ensure_loop()
-                res = asyncio.run(agent.summarize_history(force=force_all))
+                res = _run(agent.summarize_history(force=force_all))
             except KeyboardInterrupt:
                 _console.print(t(f"{_tag('interrupt')} 已取消压缩",
                                  f"{_tag('interrupt')} compression cancelled"))
@@ -832,8 +890,8 @@ def repl_loop(model: AgentModel, view: TerminalView,
                     last["new_task"] = False
 
         try:
-            model.ensure_loop()  # 跨 asyncio.run() 时重置 httpx transport
-            asyncio.run(agent.run(task, callback=on_event))
+            model.ensure_loop()  # 常驻 loop 下为 no-op，保留作防御
+            _run(agent.run(task, callback=on_event))
         except KeyboardInterrupt:
             view._close_content(preserve=False)
             view._stop_thinking()
@@ -870,7 +928,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
         # 会话标题：本轮已有真实对话，缺标题时用 LLM 生成一次（失败静默降级）
         try:
             model.ensure_loop()
-            title = asyncio.run(agent.generate_title())
+            title = _run(agent.generate_title())
             if title:
                 _console.print(t(f"[dim]{_tag('session')} 会话标题: {title}[/dim]",
                                  f"[dim]{_tag('session')} session title: {title}[/dim]"))
@@ -932,7 +990,12 @@ def run_frontend(args: argparse.Namespace) -> None:
     try:
         repl_loop(model, view, sm, sid, state, args)
     finally:
-        asyncio.run(model.close())
+        # 关闭 httpx client：此时仍在常驻 loop 上，连接与 loop 归属一致，可安全关闭
+        try:
+            _run(model.close())
+        except Exception:
+            pass  # 退出阶段不因清理失败而中断（fd 由 OS 回收）
+        _close_loop()
         # 收尾会话必须取 repl_loop 最终所在的会话（内部可能 /switch 过），
         # 否则 done 状态和 last_active_at 会写回旧会话，导致下次恢复错乱
         final_sid = sm.get_current() or sid

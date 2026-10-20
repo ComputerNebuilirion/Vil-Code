@@ -221,7 +221,9 @@ cfg = load_config()                  # 与 DEFAULTS 深合并
 
 文件只存用户实际设的字段（不把 DEFAULTS 写进文件污染），`load_config` 运行时合并。
 
-依赖：`pip install -r requirements.txt`（httpx + rich + tiktoken；Windows 自动附带 `pywin32`，Linux/macOS 由 `sys_platform` 标记跳过）。L3 沙箱在 Windows 需要 pywin32，在 Linux/macOS 用标准库 `resource`，无需额外安装。
+依赖：`pip install -r requirements.txt`（httpx + rich + prompt_toolkit + tiktoken；Windows 自动附带 `pywin32`，Linux/macOS 由 `sys_platform` 标记跳过）。L3 沙箱在 Windows 需要 pywin32，在 Linux/macOS 用标准库 `resource`，无需额外安装。
+
+REPL 的输入行（`VilAgent/input_line.py`）优先用 `prompt_toolkit` 接管整行编辑，退化顺序为 `prompt_toolkit` → `readline` → `rich` 的 `console.input`。没有它时 Linux/WSL 下方向键会以 `^[[D` 字面量进入缓冲区、退格会按字节删掉半个汉字（后续编码报 `surrogates not allowed`），详见该模块 docstring。
 
 ## 输出语言（i18n）
 

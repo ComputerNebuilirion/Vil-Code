@@ -16,6 +16,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.status import Status
 from rich.syntax import Syntax
@@ -24,6 +25,7 @@ from rich.text import Text
 from .config import load_config, set_value, get_value, CONFIG_FILE
 from .context import Context
 from .i18n import set_lang, t
+from .input_line import read_line
 from .llm import LLMClient
 from .loop import AgentLoop
 from .safety import clean_stale_sandboxes
@@ -80,9 +82,9 @@ class AgentModel:
     def ensure_loop(self) -> None:
         """确保 httpx AsyncClient 在当前事件循环里可用。
 
-        跨多次 asyncio.run() 调用时，httpx client 的 transport 绑定到
-        第一个事件循环。后续循环里使用会抛 Event loop is closed。
-        检测到循环变化时，重建 httpx client。
+        正常路径下前端用一个常驻事件循环（见 vil-agent-frontend._run），
+        此方法恒为 no-op。仅当有代码另起 asyncio.run() 时才需要重建
+        client —— 否则 transport 绑在旧循环上会抛 Event loop is closed。
         """
         try:
             current = asyncio.get_running_loop()
@@ -424,9 +426,13 @@ class TerminalView:
             body.append(preview)
         console.print(Panel(body, border_style="yellow",
                            title=t("权限请求", "permission request"), title_align="left"))
-        console.print(Text(t("  允许执行? [y/N] > ", "  Allow? [y/N] > "), style="bold"), end="")
+        # 读输入前先停掉 spinner：rich 的 Status 刷新线程会和行编辑器的重绘抢终端
+        self._stop_thinking()
+        # 提示符里有 [y/N]，必须转义，否则会被 rich 当成 style tag
+        prompt_markup = f"[bold]{escape(t('  允许执行? [y/N] > ', '  Allow? [y/N] > '))}[/bold]"
         try:
-            ans = await asyncio.to_thread(input)
+            # 用共享的跨平台输入行（裸 input() 在 Linux/WSL 下方向键会变成 ^[[D）
+            ans = await asyncio.to_thread(read_line, prompt_markup, console)
         except (EOFError, KeyboardInterrupt):
             console.print()
             return "deny"

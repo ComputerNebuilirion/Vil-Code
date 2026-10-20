@@ -53,6 +53,9 @@ def run_command(command: str, timeout: float = 30, _ctx=None) -> str:
             shell=True,
             cwd=ws,
             capture_output=True,
+            # 不把 tty 的 stdin 继承给子进程：Linux 下 cat/read/ssh 之类会
+            # 抢走终端按键，表现为输入被吃掉、提示符被抹掉
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8", errors="replace",
             timeout=timeout,
