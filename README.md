@@ -65,6 +65,125 @@ VilAgent/
 
 只读由工具过滤强制；ask 的 prompt 也说明只读（双保险，且 ask/do 姿态分开）。
 
+## 安装与启动
+
+### 前置要求
+
+- **Python ≥ 3.10**：代码直接用 PEP 604 语法（`str | None` 等）做注解，注解在 import 期求值，3.9 会抛 `TypeError` 而非静默降级。
+- 无编译型依赖，`requirements.txt` 里只有 `httpx` / `rich` / `tiktoken`。
+- 平台差异只有一处：L3 沙箱在 Windows 依赖 `pywin32`（Job Object），在 Linux/macOS 用标准库 `resource`（rlimit）——已由 `pep508` 标记 `pywin32>=306; sys_platform == "win32"` 自动处理，**不需要手写条件安装**。详见「安全（三层防御）」一节。
+
+### Windows（cmd / PowerShell）
+
+```bat
+:: 仓库根目录下
+py -3 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+
+:: 验证：应打印 C:\Users\<name>\.vil\config.json
+python vil-agent-cli.py config path
+```
+
+PowerShell 用 `.\.venv\Scripts\Activate.ps1`；若被执行策略拦住，先 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`，或干脆不激活虚拟环境，直接 `.venv\Scripts\python.exe vil-agent-cli.py ...`。
+
+cmd 里中文参数/帮助偶发乱码时先 `chcp 65001`（`run_command` 工具内部已自行处理，这一条只影响交互式命令行）。
+
+### Linux / macOS
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate          # fish 用 `.venv/bin/activate.fish`
+pip install -r requirements.txt
+
+# 验证
+python3 vil-agent-cli.py config path   # → /home/<name>/.vil/config.json
+```
+
+macOS 与 Linux 行为一致，均无需额外包。L3 在 Linux 上限制的是 `RLIMIT_AS`（虚拟地址空间），不是 RSS。
+
+> `tiktoken` 首次运行会下载 `cl100k_base` 词表；离线环境下载失败时 `state.count_tokens` 自动降级为「字符数 / 3」，功能不受影响，仅 token 估算变粗。
+
+### 首次配置
+
+两个入口启动时读 `~/.vil/config.json`，先用 CLI 写入模型与密钥：
+
+```bash
+python vil-agent-cli.py config set llm.endpoint https://api.deepseek.com/v1
+python vil-agent-cli.py config set llm.model deepseek-v4-flash
+python vil-agent-cli.py config set llm.api_key sk-...
+python vil-agent-cli.py config list        # 敏感字段已掩码
+```
+
+下文示例统一写作 `vil-agent`，即 `python vil-agent-cli.py` 的简写。想直接用短命令，按平台加个别名：
+
+```bat
+:: Windows：写成 vil-agent.cmd 放到 PATH 里
+@echo off
+python "D:\path\to\vil-code\vil-agent-cli.py" %*
+```
+
+```bash
+# Linux / macOS：~/.bashrc 或 ~/.zshrc
+alias vil-agent='python3 /path/to/vil-code/vil-agent-cli.py'
+```
+
+### 两种启动方式
+
+仓库提供两个 Controller，共享同一套 Model/View（见「MVC 共享层」），区别只在交互形态：
+
+| 入口 | 形态 | 适用 |
+|---|---|---|
+| `vil-agent-cli.py` | 单次任务：跑完即退，子命令 `ask` / `do` / `review` + `history` / `config` | 脚本、CI、一次性问询 |
+| `vil-agent-frontend.py` | 多轮 REPL：banner + 彩色提示符 + `/help` `/new` `/history` `/exit` 等斜杠命令 | 日常交互 |
+
+**单次执行（CLI）**——模式是子命令，必须显式给出：
+
+```bash
+vil-agent ask 列出当前目录文件并说明项目结构
+vil-agent do 在项目根加 hello.py
+vil-agent review 审查 VilAgent/loop.py
+vil-agent do --new 隔离执行不相关任务          # 不续接上次会话
+vil-agent do --continue <session_id> 续接指定会话
+vil-agent ask --no-stream --max-steps 10 快速看一眼
+```
+
+**多轮 REPL（frontend）**——模式是 flag，默认 `ask`：
+
+```bash
+python vil-agent-frontend.py                      # 默认 ask 模式
+python vil-agent-frontend.py --mode do            # 允许写操作
+python vil-agent-frontend.py --mode review
+python vil-agent-frontend.py --new                # 强制新会话
+```
+
+REPL 内 `/help` 查看全部斜杠命令，`/exit` 退出，Ctrl+C 中止当前任务但保留会话。
+
+### 会话与历史落盘位置
+
+默认 `~/.vil/`（Windows 即 `C:\Users\<name>\.vil\`）：
+
+```
+~/.vil/
+├── config.json          全局配置
+└── sessions/
+    ├── index.json       会话元数据
+    └── {sid}.jsonl      每个会话一个历史文件（+ .todo.json / .summary.json）
+```
+
+设 `VIL_SESSIONS_DIR` 可整体改掉 `sessions/` 位置，多实例并行或测试隔离时用：
+
+```bash
+VIL_SESSIONS_DIR=/tmp/vil-test python vil-agent-cli.py ask 测试
+```
+
+```bat
+:: 注意引号必须包住整个 VAR=VALUE，否则 ` && ` 前的空格会被吞进路径
+set "VIL_SESSIONS_DIR=D:\tmp\vil-test" && python vil-agent-cli.py ask 测试
+```
+
+历史操作（跨平台一致）：`vil-agent history list | show | clear | export | retitle`。
+
 ## 用法
 
 ```python
