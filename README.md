@@ -299,14 +299,14 @@ def my_tool(foo: str, _ctx=None) -> str:
 ┌──────────────────────────────────────────┐
 │ L1 预检层（AST 分类，零信任，仅预警）       │  ast_check.py
 ├──────────────────────────────────────────┤
-│ L2 权限层（ask/deny，per-action，跨平台）   │  permissions.py
+│ L2 权限层（ask/deny，per-action，跨平台）  │  permissions.py
 ├──────────────────────────────────────────┤
-│ L3 OS 沙箱（Job Object / rlimit，跨平台）    │  sandbox.py
+│ L3 OS 沙箱（Job Object / rlimit，跨平台）  │  sandbox.py
 └──────────────────────────────────────────┘
 ```
 
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
-  高危（`exec/eval/ctypes/win32*`）= 可逃逸沙箱，L3 直接拒；中等（网络/执行/写）= 放行进沙箱并交给 L2 决策。
+  高危（`exec/eval/ctypes/win32*`等）= 可逃逸沙箱，L3 直接拒；中等（网络/执行/写）= 放行进沙箱并交给 L2 决策。
 
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
 
@@ -324,7 +324,7 @@ def my_tool(foo: str, _ctx=None) -> str:
   格式：`{"rules":[{"tool":"run_command","pattern":"git *","action":"allow"}]}`，fnmatch 对 `args["path"]` / `args["command"]` / `args["code"]` **逐个匹配，命中任一即算**。
   
   例：`{"tool":"run_command","action":"allow"}`（省略 `pattern`）可把该工具所有调用整体放行（充分自动化）；`{"tool":"write_file","pattern":"src/**","action":"deny"}` 可反向收紧。
-  
+
   `action="ask"` 时调用 `permission_handler`（由调用方提供，如 CLI 交互输入）。
 - **L3 `sandbox_run(code, timeout, mem_mb, cwd)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
   - **Windows（有 pywin32）**：Job Object 限制内存/CPU/UI，超时用 `TerminateJobObject` 杀整个 Job（含后代）。
