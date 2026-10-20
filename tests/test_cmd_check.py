@@ -44,6 +44,25 @@ class TestMatchDangerousCommand(unittest.TestCase):
     def test_empty(self):
         self.assertIsNone(match_dangerous_command(""))
 
+    # ---- Linux 专属强化项 ----
+    def test_linux_fork_bomb(self):
+        self.assertIsNotNone(match_dangerous_command(":(){ :|:& };:"))
+        self.assertIsNotNone(match_dangerous_command(":() { :|: & };:"))
+
+    def test_linux_chmod_root_recursive(self):
+        self.assertIsNotNone(match_dangerous_command("chmod -R 777 /"))
+        self.assertIsNotNone(match_dangerous_command("sudo chmod -R a+rwx /"))
+
+    def test_linux_raw_disk_write(self):
+        self.assertIsNotNone(match_dangerous_command("echo x > /dev/sda"))
+        self.assertIsNotNone(match_dangerous_command("cat img > /dev/nvme0n1"))
+
+    def test_common_safe_commands_not_flagged(self):
+        # /dev/null、普通 chmod 目标、相对路径重定向都不应误伤
+        for cmd in ("ls > /dev/null", "cat a > /dev/null 2>&1",
+                    "chmod 755 ./run.sh", "echo ok > out.txt"):
+            self.assertIsNone(match_dangerous_command(cmd), cmd)
+
 
 class TestClassifyCommand(unittest.TestCase):
     def test_low(self):

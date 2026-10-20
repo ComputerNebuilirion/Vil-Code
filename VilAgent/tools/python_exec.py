@@ -8,14 +8,15 @@ from ..safety import classify, sandbox_run
     name="run_python",
     description=L(
         "在沙箱里执行 Python 代码（需 --trust；高危代码会被 L1 预检拦截）。"
-        "注意：脚本运行在系统临时目录（Windows 通常在 C 盘）里的独立沙箱中，"
+        "注意：脚本运行在系统临时目录（Linux 为 /tmp，Windows 通常为 C 盘）里的独立沙箱中，"
         "cwd 不是工作区，且环境变量已清理；因此不能用相对路径访问工作区文件。"
         "需要读工作区数据时，请先用 read_file/search_code 取出内容，"
         "再在代码里内联传入或使用绝对路径。",
         "Run Python code in a sandbox (requires --trust; high-risk code is blocked by the L1 pre-check). "
-        "Note: scripts run in an isolated sandbox under the system temp dir (usually on C: on Windows), "
-        "the cwd is NOT the workspace, and environment variables are cleared; so you cannot use relative "
-        "paths to reach workspace files. To read workspace data, first fetch it with read_file/search_code, "
+        "Note: scripts run in an isolated sandbox under the system temp dir "
+        "(/tmp on Linux, usually C: on Windows), the cwd is NOT the workspace, and environment "
+        "variables are cleared; so you cannot use relative paths to reach workspace files. "
+        "To read workspace data, first fetch it with read_file/search_code, "
         "then inline it or pass an absolute path in the code.",
     ),
     parameters={

@@ -9,7 +9,10 @@
   - Windows/PowerShell 破坏性命令：`rd /s /q`、`rmdir /s`、`Remove-Item -Recurse`
 
 本层是「硬底线」判定（配合 L2 permissions 的不可放行 deny），不追求完备——
-真正的隔离仍靠 L3 沙箱。
+真正的隔离仍靠 L3 沙箱（Windows Job Object / POSIX rlimit）。
+
+黑名单混合了三类平台条目（Unix / Windows cmd / PowerShell），互相为死代码但
+无害：Linux 上 Unix 段生效，Windows 上 cmd/PowerShell 段生效。
 """
 import re
 
@@ -34,6 +37,14 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[str, str]] = [
     ("shred", r"\bshred\b"),
     ("mkfs", r"\bmkfs(?:\.\w+)?\b"),
     ("dd of=", r"\bdd\b.*?\bof="),
+    # ---- Linux 专属强化（硬底线，不求完备）----
+    # fork 炸弹 :(){ :|:& };:
+    ("fork bomb", r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
+    # 把根目录权限开成人人可写：chmod -R 777 /
+    ("chmod 777 /", r"\bchmod\s+(?:-\S+\s+)*(?:777|a\+rwx)\s+(?:-\S+\s+)*/(?:\s|$|;|&|\|)"),
+    # 直接写裸块设备（绕过文件系统毁数据）：> /dev/sda
+    ("raw disk write", r">\s*/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|disk)"),
+    ("tee to disk", r"\btee\s+(?:-\S+\s+)*/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|disk)"),
     # ---- Windows cmd ----
     ("del", r"(?:^|[;&|]\s*)(?:del|erase)\b"),
     ("rd /s", r"(?:^|[;&|]\s*)r(?:d|mdir)\b.*?\s/s\b"),

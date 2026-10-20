@@ -6,11 +6,29 @@ import random
 import time
 from typing import AsyncGenerator, Callable
 
-import httpx
+from .i18n import t
+
+# 软依赖：httpx 只在真正调用 LLM 时才必需。
+# 否则 `import VilAgent`（连带 tests 里的 safety/tools 用例）在干净环境下会
+# 直接 ModuleNotFoundError，Linux 部署/CI 里很别扭。
+try:
+    import httpx
+except ImportError:  # pragma: no cover - 取决于环境是否装了 httpx
+    httpx = None  # type: ignore[assignment]
 
 
 class LLMError(Exception):
     pass
+
+
+def _require_httpx():
+    """延迟校验软依赖：只在要发请求时报错，import 期不炸"""
+    if httpx is None:
+        raise LLMError(t(
+            "缺少依赖 httpx，请先安装：pip install httpx",
+            "missing dependency httpx; install it with: pip install httpx",
+        ))
+    return httpx
 
 
 # 触发重试的 HTTP 状态码（临时性故障）
@@ -31,6 +49,7 @@ class LLMClient:
                  max_tokens: int | None = None,
                  max_retries: int = 3,
                  retry_base_delay: float = 0.5):
+        _require_httpx()  # 缺 httpx 时在这里给出友好报错，而不是 import 期就崩
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.api_key = api_key

@@ -30,6 +30,11 @@ def grep_file(pattern: str, path: str, max_results: int = 30, _ctx=None) -> str:
     if not target.exists():
         return f"Error: path not found: {path}"
 
+    # 显式越界校验（目录分支 os.walk 会走出工作区，靠 relative_to 抛异常兜底
+    # 虽然不泄漏内容，但会变成 ValueError 栈信息；这里提前拦成统一错误）
+    if not is_path_safe(path, ws):
+        return f"Error: path '{path}' escapes workspace"
+
     matches: list[str] = []
 
     def _search_file(fp: Path) -> None:

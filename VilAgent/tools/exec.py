@@ -6,10 +6,22 @@ from . import tool
 from ..i18n import L
 from ..safety import match_dangerous_command
 
+# shell=True 在各平台的实际解释器：Windows = cmd.exe，POSIX = /bin/sh（非 bash）
+# 把结果直接写进工具描述，提示 LLM 生成「当前平台语法」的命令，
+# 避免 Linux 上产出 dir/copy/del 这类 cmd 风格命令。
+_SHELL_NAME = "cmd.exe" if sys.platform == "win32" else "POSIX sh (/bin/sh, not bash)"
+
 
 @tool(
     name="run_command",
-    description=L("执行 shell 命令并返回输出（需要 --trust）", "Run a shell command and return its output (requires --trust)"),
+    description=L(
+        f"执行 shell 命令并返回输出（需要 --trust）。"
+        f"当前平台由 {_SHELL_NAME} 执行，请使用该 shell 的语法"
+        f"（Windows 用 dir/del，Linux/macOS 用 ls/rm）。",
+        f"Run a shell command and return its output (requires --trust). "
+        f"Commands run under {_SHELL_NAME} on this platform, so use its syntax "
+        f"(dir/del on Windows, ls/rm on Linux/macOS).",
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -33,6 +45,7 @@ def run_command(command: str, timeout: float = 30, _ctx=None) -> str:
     # 这样我们用 encoding="utf-8" 解码才正确（否则中文乱码）
     if sys.platform == "win32":
         command = f"chcp 65001 >nul 2>&1 && {command}"
+    # POSIX 下 shell=True 走 /bin/sh，输出本就是 UTF-8，无需前缀
 
     try:
         result = subprocess.run(

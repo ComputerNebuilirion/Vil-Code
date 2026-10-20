@@ -11,7 +11,7 @@
 | Context | `context.py` | 采集工作区路径、文件列表、git 状态 |
 | LLM | `llm.py` | OpenAI-compatible chat completions，httpx async，流式 tool_calls 累积，重试/退避 + 流式降级 |
 | Tools | `tools/` | `@tool` 装饰器注册中心 + file/search/edit/exec/git/**todo** 工具 |
-| Safety | `safety/` | AST 静态检查 + Windows Job 沙箱 + 路径穿越防护 |
+| Safety | `safety/` | AST 静态检查 + OS 沙箱（Windows Job Object / POSIX rlimit）+ 路径穿越防护 |
 | Loop | `loop.py` | ReAct 循环 + tool result 截断 + 循环检测 + KeyboardInterrupt 处理 + `last_stats` 同步写入 + 长会话摘要触发 |
 | State | `state.py` | JSONL 对话历史：滑窗 `max_length=30` + L2 工具结果压缩 + 孤立 tool 剔除 + token 预算 + 摘要缓存 |
 | Session | `session.py` | `SessionManager`：按 session_uuid 物理隔离历史（`index.json` + `{sid}.jsonl`） |
@@ -42,7 +42,7 @@ VilAgent/
 │   ├── file.py        read_file / write_file / delete_file / search_code / list_dir
 │   ├── search.py      grep_file（代码库搜索，只读）
 │   ├── edit.py        edit_file（patch 模式，局部修改，需 trust）
-│   ├── exec.py        run_command（Windows 前置 chcp 65001 修 GBK 乱码）
+│   ├── exec.py        run_command（Windows 前置 chcp 65001 修 GBK 乱码；POSIX 走 /bin/sh）
 │   ├── python_exec.py run_python（串联 L1→L2→L3）
 │   ├── git.py         git_status / git_diff
 │   ├── todo.py        todo_write（Agent 自主规划、整列表替换、readonly）
@@ -102,7 +102,7 @@ cfg = load_config()                  # 与 DEFAULTS 深合并
 
 文件只存用户实际设的字段（不把 DEFAULTS 写进文件污染），`load_config` 运行时合并。
 
-依赖：`pip install -r requirements.txt`（httpx + rich + tiktoken）。Windows 用户想用 L3 沙箱可手动 `pip install pywin32`。
+依赖：`pip install -r requirements.txt`（httpx + rich + tiktoken；Windows 自动附带 `pywin32`，Linux/macOS 由 `sys_platform` 标记跳过）。L3 沙箱在 Windows 需要 pywin32，在 Linux/macOS 用标准库 `resource`，无需额外安装。
 
 ## 输出语言（i18n）
 
@@ -170,29 +170,29 @@ def my_tool(foo: str, _ctx=None) -> str:
 
 `_ctx` 永远是 kwargs，包含 `workspace` / `trust` / `mode`。
 
-## 安全（三层防御，Windows 主力）
+## 安全（三层防御，Windows / Linux / macOS）
 
 参考 Claude Code：AST 不是安全边界（混淆代码永远能绕过字符串匹配），真正隔离靠运行时。
 
-Windows 没有 OS 级文件/网络沙箱（Claude Code 自己也没做），所以 **L2 权限层是 Windows 上的实际安全边界**。
+即使有 OS 沙箱，**L2 权限层仍是主要的实际安全边界**（沙箱只限制资源，不限制能访问哪些文件）。
 
 ```
 ┌──────────────────────────────────────────┐
 │ L1 预检层（AST 分类，零信任，仅预警）       │  ast_check.py
 ├──────────────────────────────────────────┤
-│ L2 权限层（ask/deny，per-action，跨平台）   │  permissions.py  ← Windows 主力
+│ L2 权限层（ask/deny，per-action，跨平台）   │  permissions.py
 ├──────────────────────────────────────────┤
-│ L3 OS 沙箱（Job Object，能用的平台才上）     │  sandbox.py
+│ L3 OS 沙箱（Job Object / rlimit，跨平台）    │  sandbox.py
 └──────────────────────────────────────────┘
 ```
 
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
   高危（`exec/eval/ctypes/win32*`）= 可逃逸沙箱，L3 直接拒；中等（网络/执行/写）= 放行进沙箱并交给 L2 决策。
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
-  `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse` …）判 `high`，网络工具判 `medium`。
+  `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse`，以及 Linux 专属的 fork 炸弹 / `chmod -R 777 /` / `> /dev/sda` …）判 `high`，网络工具判 `medium`。
 - **L2 `PermissionSystem`** → 工具调用前决策 `allow/ask/deny`。
   顺序：readonly 工具放行 → 内置 deny 硬底线（危险命令，**用户规则无法放行**）→ 用户规则命中 → 默认姿态。
-  硬底线用 `match_dangerous_command()` 对命令做**规范化（小写+折叠空白）+ 正则 search**，可覆盖大小写（`RM -RF /`）、前缀（`sudo rm -rf /`）、拼接（`echo x && rm -rf /`）以及 Windows/PowerShell（`del`/`rd /s`/`format`/`Remove-Item -Recurse`）等绕过写法（`exec.py` 复用同一匹配器，避免两套口径不一致）。
+  硬底线用 `match_dangerous_command()` 对命令做**规范化（小写+折叠空白）+ 正则 search**，可覆盖大小写（`RM -RF /`）、前缀（`sudo rm -rf /`）、拼接（`echo x && rm -rf /`）以及 Windows/PowerShell（`del`/`rd /s`/`format`/`Remove-Item -Recurse`）、Linux 专属（fork 炸弹 `:(){ :|:& };:`、根目录放开权限 `chmod -R 777 /`、裸块设备写入 `> /dev/sda`/`tee /dev/nvme0n1`）等绕过写法（`exec.py` 复用同一匹配器，避免两套口径不一致）。黑名单混合三类平台条目（Unix / Windows cmd / PowerShell），在各自平台上互为死代码但无害，不按平台分层以保持单一口径。
 
   **默认姿态（trust 模式 / do 模式）**：写/编辑类工具（`write_file`/`edit_file`）自动 **allow**（低摩擦，自动化友好）；命令/代码执行类（`run_command`/`run_python`）**ask** 人工确认；破坏性工具（`delete_file`）因删除不可逆，亦单独 **ask**；`risk=high` 亦 **ask**。非 trust 模式写/执行一律 **deny**。
 
@@ -200,10 +200,12 @@ Windows 没有 OS 级文件/网络沙箱（Claude Code 自己也没做），所�
   格式：`{"rules":[{"tool":"run_command","pattern":"git *","action":"allow"}]}`，fnmatch 对 `args["path"]` / `args["command"]` / `args["code"]` **逐个匹配，命中任一即算**。
   例：`{"tool":"run_command","action":"allow"}`（省略 `pattern`）可把该工具所有调用整体放行（充分自动化）；`{"tool":"write_file","pattern":"src/**","action":"deny"}` 可反向收紧。
   `action="ask"` 时调用 `permission_handler`（由调用方提供，如 CLI 交互输入）。
-- **L3 `sandbox_run(code, timeout, mem_mb, cwd)`** → Windows Job Object 限制内存/CPU/UI，环境清理剥离 API key/secret，超时用 `TerminateJobObject` 杀整个 Job（含后代）。
-  默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
-  非 Windows / 无 pywin32 退化为 `subprocess + timeout`（best-effort）。
-  Linux/macOS 的 bubblewrap / sandbox-exec 路径 **TODO**（等平台条件）。
+- **L3 `sandbox_run(code, timeout, mem_mb, cwd)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
+  - **Windows（有 pywin32）**：Job Object 限制内存/CPU/UI，超时用 `TerminateJobObject` 杀整个 Job（含后代）。
+  - **Linux / macOS**：`resource.setrlimit` 限制 `RLIMIT_AS`（内存，默认 256MB，超限时被测代码拿到 `MemoryError` 可自行交代原因）、`RLIMIT_CPU`（CPU 兜底）、`RLIMIT_NOFILE`（句柄数）；`start_new_session=True` + 超时 `killpg` 回收整个进程组（**含孙进程**，只用 `kill()` 会漏）。
+  - 两者都不可用（如 Windows 无 pywin32）→ `subprocess + timeout` best-effort，**且在输出里显式告警「mem_mb 被忽略」**，不静默降级。
+  - 不设 `RLIMIT_NPROC`：它按 uid 全局计数，会误伤正常 `Popen`（实测 EAGAIN）；防 fork 炸弹交给 cgroup `pids.max`。
+  - 已知边界：`RLIMIT_AS` 限的是虚拟地址空间而非 RSS，`mmap` 大文件型负载会比 RSS 更早被拒。bubblewrap / sandbox-exec 的额外 mount 隔离仍 **TODO**。
 - **路径**：`is_path_safe(path, workspace)` 防止 `..` 越界。
 
 `run_python` 工具串联三层：L1 分类 → L2 权限 → L3 沙箱执行。

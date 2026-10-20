@@ -1,4 +1,5 @@
 """文件操作工具"""
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -103,8 +104,9 @@ def delete_file(path: str, _ctx=None) -> str:
     # —— 防呆层（在权限确认之前，直接拒绝明显误用）——
     # 1. 通配符：delete_file 不支持 glob，防 agent 当 rm *.py 用
     if any(c in path for c in "*?["):
+        rm_hint = "del" if os.name == "nt" else "rm"
         return (f"Error: wildcards not supported in delete_file "
-                f"(got '{path}'); use run_command('del') if you really need glob")
+                f"(got '{path}'); use run_command('{rm_hint}') if you really need glob")
 
     # 2. 空路径 / 根路径
     if not path or path in (".", "/", "\\"):
@@ -172,6 +174,21 @@ def _is_protected_delete(path: str) -> bool:
     return False
 
 
+def _glob_match(rel: str, pattern: str) -> bool:
+    """rel（相对工作区路径）是否匹配 glob。
+
+    兼容 LLM 常写的 '**/*.py'：fnmatch 的 * 会跨 '/'，但 '**/' 前缀要求
+    至少一层目录，故同时尝试剥掉前缀和只用 basename 匹配。
+    """
+    if pattern in ("", "*", "**", "**/*", "**/**"):
+        return True
+    rel = rel.replace(os.sep, "/")
+    if fnmatch.fnmatch(rel, pattern):
+        return True
+    stripped = pattern[3:] if pattern.startswith("**/") else pattern
+    return fnmatch.fnmatch(rel, stripped) or fnmatch.fnmatch(os.path.basename(rel), stripped)
+
+
 @tool(
     name="search_code",
     description=L("在代码中搜索文本，返回匹配的行和行号", "Search text in code, returning matching lines and line numbers"),
@@ -209,6 +226,8 @@ def search_code(query: str, glob: str = "**/*", _ctx=None) -> str:
             return "Error: search timed out"
 
     # fallback: 遍历文件
+    # 无 ripgrep 时 glob 必须自己过滤：否则 -g '**/*.py' 会静默失效，
+    # 调用方以为收窄了范围，实际全库都在搜（还拖慢速度）。
     matches = []
     for root, dirs, files in os.walk(ws):
         # 跳过隐藏目录和常见忽略目录
@@ -217,6 +236,8 @@ def search_code(query: str, glob: str = "**/*", _ctx=None) -> str:
         for fname in files:
             fpath = os.path.join(root, fname)
             rel = os.path.relpath(fpath, ws)
+            if not _glob_match(rel, glob):
+                continue
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f, 1):
