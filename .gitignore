@@ -3,3 +3,4 @@
 __pycache__
 pytest.ini
 session_*.md
+tests/
