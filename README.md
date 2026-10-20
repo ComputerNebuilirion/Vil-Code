@@ -306,7 +306,7 @@ def my_tool(foo: str, _ctx=None) -> str:
 ```
 
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
-  高危（`exec/eval/ctypes/win32*`等）= 可逃逸沙箱，L3 直接拒；中等（网络/执行/写）= 放行进沙箱并交给 L2 决策。
+  高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L3 直接拒；中等（网络/执行/写）=放行进沙箱并交给 L2 决策。
 
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
 
