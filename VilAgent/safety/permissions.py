@@ -3,13 +3,16 @@
 设计哲学（参考 Claude Code 在 Windows 上的做法）：没有 OS 级沙箱时，
 per-action 权限评估就是安全边界。trust 控制默认姿态，规则文件细化。
 
-默认姿态（trust=True，即 do 模式）：
+默认姿态由**用户可选的权限层级**（`permission_level`）决定，
+公共前置（trust=True，即 do 模式）：
   - 只读工具            → allow
   - 内置高危 deny 规则  → deny（硬底线，用户规则无法放行）
-  - 写/编辑类工具       → allow（低摩擦，自动化友好）
-  - 命令/代码执行类工具 → ask（run_command / run_python，仍人工确认）
-  - 破坏性工具          → ask（delete_file，删除不可逆，单独收紧）
   - 高危（risk=high）   → ask
+层级（`level`，见 normalize_level）：
+  - strict   → 所有非只读操作一律 ask（写/编辑也不例外，最保守）
+  - balanced → 写/编辑类 allow；命令/代码执行类 ask；破坏性工具 ask（默认值）
+  - auto     → 在 balanced 基础上，静态检查 risk=low 的 run_command / run_python
+               直接 allow，risk=medium/high 仍需 ask
 非 trust 模式：写/执行一律 deny（只读放行）。
 
 规则文件（用户可覆盖默认，用于进一步放松或收紧）：
@@ -25,14 +28,64 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..i18n import t
-from .cmd_check import match_dangerous_command
+from .ast_check import classify
+from .cmd_check import classify_command, match_dangerous_command
 
 ALLOW = "allow"
 ASK = "ask"
 DENY = "deny"
 
+# —— 用户可选的权限层级（config: permission_level / CLI --permission / REPL /perm）——
+# strict   所有非只读操作都要人工确认（写/编辑也不例外）
+# balanced 只有命令/代码执行 + 破坏性操作要确认，写/编辑直接放行（默认）
+# auto     balanced + 静态检查 risk=low 的命令/代码直接放行（medium/high 仍确认）
+LEVEL_STRICT = "strict"
+LEVEL_BALANCED = "balanced"
+LEVEL_AUTO = "auto"
+DEFAULT_LEVEL = LEVEL_BALANCED
+
+# 别名：允许用户写 1/2/3 或语义化词，未知值一律回退默认层级
+_LEVEL_ALIASES = {
+    "1": LEVEL_STRICT, "strict": LEVEL_STRICT, "all": LEVEL_STRICT,
+    "ask": LEVEL_STRICT,
+    "2": LEVEL_BALANCED, "balanced": LEVEL_BALANCED,
+    "default": LEVEL_BALANCED, "normal": LEVEL_BALANCED,
+    "3": LEVEL_AUTO, "auto": LEVEL_AUTO, "yolo": LEVEL_AUTO,
+}
+
+
+def normalize_level(level) -> str:
+    """把用户输入（config/CLI/别名）归一化为三种层级之一，未知值回退默认"""
+    return _LEVEL_ALIASES.get(str(level or "").strip().lower(), DEFAULT_LEVEL)
+
+
+def level_label(level) -> str:
+    """层级的单行说明（给 /perm、banner 等人看）"""
+    level = normalize_level(level)
+    if level == LEVEL_STRICT:
+        return t("strict：所有非只读操作都要确认",
+                 "strict: confirm every non-readonly action")
+    if level == LEVEL_AUTO:
+        return t("auto：低风险命令/代码直接放行，中/高风险确认",
+                 "auto: low-risk commands and code run directly, medium/high ask")
+    return t("balanced：只有命令/删除类操作需要确认",
+             "balanced: only command / delete actions need confirmation")
+
+
 # 即使 trust=True 也仍需人工确认的「执行类」工具（其余非只读工具默认放行）
 _EXEC_TOOLS = {"run_command", "run_python"}
+
+# auto 层级可以直接放行的执行类工具（静态检查 risk=low 时）
+_AUTO_RISK_TOOLS = {"run_command", "run_python"}
+
+
+def _classify_risk(tool_name: str, args: dict) -> str | None:
+    """给 auto 层级补一次静态风险分类（命令层 / AST 层各用各的分类器）"""
+    if tool_name == "run_command":
+        return classify_command(str(args.get("command") or "")).get("risk")
+    if tool_name == "run_python":
+        return classify(str(args.get("code") or "")).get("risk")
+    return None
 
 # 即使 trust=True 也仍需人工确认的「破坏性」工具：删除不可逆，单独收紧为 ask
 _DESTRUCTIVE_TOOLS = {"delete_file"}
@@ -77,15 +130,19 @@ class PermissionSystem:
       1. readonly 工具 → allow
       2. 内置 deny 硬底线命中 → deny（用户规则无法放行）
       3. 用户规则命中（默认规则文件或显式传入）→ 该规则的 action
-      4. 默认姿态：
-         - risk=high          → trust ? ask : deny
-         - 非 trust（写/执行）→ deny
-         - trust + 执行/破坏类 → ask（run_command / run_python / delete_file）
-         - trust + 写/编辑类  → allow
+      4. 默认姿态（由 trust + level 共同决定）：
+         - risk=high              → trust ? ask : deny
+         - 非 trust（写/执行）     → deny
+         - level=strict           → ask（所有非只读）
+         - level=auto + run_command + risk=low → allow
+         - 执行/破坏类（run_command / run_python / delete_file）→ ask
+         - 写/编辑类              → allow
     """
 
-    def __init__(self, rules_file: Path | str | None = None, trust: bool = False):
+    def __init__(self, rules_file: Path | str | None = None, trust: bool = False,
+                 level: str = DEFAULT_LEVEL):
         self.trust = trust
+        self.level = normalize_level(level)
         self.rules_file = str(rules_file) if rules_file else ""
         self.user_rules: list[Rule] = []
         # 规则文件加载失败时的说明（供上层告警，不影响循环继续）
@@ -146,6 +203,19 @@ class PermissionSystem:
             return ASK if self.trust else DENY
         if not self.trust:
             return DENY
+        # 层级 1（strict）：所有非只读操作都要人工确认，写/编辑也不例外
+        if self.level == LEVEL_STRICT:
+            return ASK
+        # 层级 3（auto）：静态检查 low 的执行类调用直接放行（medium/high 仍 ask）
+        # run_python 与 run_command 同等待遇：沙箱本身已有限额隔离，
+        # 让「安全的临时计算」零摩擦，模型才愿意走沙箱，
+        # 而不是 write_file 造脚本再 run_command 绕过去。
+        if self.level == LEVEL_AUTO and tool_name in _AUTO_RISK_TOOLS:
+            if risk is None:
+                # 调用方没先分类时自行补一次（只读分类，无副作用）
+                risk = _classify_risk(tool_name, args)
+            if risk == "low":
+                return ALLOW
         if tool_name in _EXEC_TOOLS or tool_name in _DESTRUCTIVE_TOOLS:
             return ASK
         return ALLOW

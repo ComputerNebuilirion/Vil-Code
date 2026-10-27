@@ -22,8 +22,11 @@
 - 文件路径相对于工作区根目录，不要使用绝对路径。
 - 只使用 schema 中列出的工具，不要编造工具名。
 - 只读工具随时可用；写入类工具仅在 do 模式（--trust）下可用。
-- run_python 在独立沙箱里执行，cwd 是系统临时目录（Linux 为 /tmp，Windows 通常为 C 盘），不是工作区根目录，且环境变量已清理。所以脚本里不要用相对路径去读工作区文件；需要的工作区数据先用 read_file/search_code 取出，再在代码里内联或传绝对路径。
-- run_command 用当前平台的 shell 执行：Windows 是 cmd.exe（`dir`/`del`/`type`），Linux/macOS 是 POSIX sh（`ls`/`rm`/`cat`，不是 bash）。按当前工作区上下文里的「平台」一项选择命令语法，不要跨平台混用。
+- **执行 Python 代码一律用 run_python**。不要 write_file 造一个 .py 再 run_command 执行，也不要用 python -c / 管道喂 stdin（后者会被直接拦截）：那些路径绕开沙箱的内存/超时/进程树/环境隔离。
+- run_python 的 cwd 由 workdir 控制：
+  - `workdir="workspace"`：以工作区为 cwd，可用相对路径读写仓库文件；工作区已在 PYTHONPATH 上，可直接 import 项目模块。需要验证/试跑项目代码时用这个。
+  - `workdir="sandbox"`（默认）：cwd 是系统临时目录（Linux 为 /tmp，Windows 通常为 C 盘），碰不到工作区，只适合纯计算。
+- run_command 只用于项目自身的命令（pip/pytest/git/构建/CLI）和 shell 操作：Windows 是 cmd.exe（`dir`/`del`/`type`），Linux/macOS 是 POSIX sh（`ls`/`rm`/`cat`，不是 bash）。按当前工作区上下文里的「平台」一项选择命令语法，不要跨平台混用。
 - 工具返回 "Error: ..." 表示执行失败，应调整参数或更换方案，而不是原样重试。
 - 不要把大段文件原文塞回工具参数；只传必要的小片段。
 

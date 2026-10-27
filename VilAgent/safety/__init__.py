@@ -1,7 +1,11 @@
 from .ast_check import check_safety, classify, is_valid_python, contains_unsafe_patterns
 from .cmd_check import match_dangerous_command, classify_command, normalize_command
-from .sandbox import sandbox_run, clean_stale_sandboxes
-from .permissions import PermissionSystem, Rule, ALLOW, ASK, DENY
+from .sandbox import sandbox_run, clean_stale_sandboxes, child_utf8_env, decode_output
+from .permissions import (
+    PermissionSystem, Rule, ALLOW, ASK, DENY,
+    LEVEL_STRICT, LEVEL_BALANCED, LEVEL_AUTO, DEFAULT_LEVEL,
+    normalize_level, level_label,
+)
 from pathlib import Path
 
 
@@ -31,10 +35,18 @@ __all__ = [
     "contains_unsafe_patterns",
     "sandbox_run",
     "clean_stale_sandboxes",
+    "child_utf8_env",
+    "decode_output",
     "is_path_safe",
     "PermissionSystem",
     "Rule",
     "ALLOW",
     "ASK",
     "DENY",
+    "LEVEL_STRICT",
+    "LEVEL_BALANCED",
+    "LEVEL_AUTO",
+    "DEFAULT_LEVEL",
+    "normalize_level",
+    "level_label",
 ]

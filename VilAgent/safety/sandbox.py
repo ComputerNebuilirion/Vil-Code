@@ -6,6 +6,7 @@ POSIX (Linux/macOS): resource.setrlimit 限内存(RLIMIT_AS)/CPU(RLIMIT_CPU)/句
                    start_new_session + killpg 杀整个进程组（含孙进程）。
 兜底:              subprocess + timeout（best-effort，非真正沙箱；会显式告警）。
 """
+import locale
 import math
 import os
 import shutil
@@ -59,7 +60,8 @@ def _no_limit_warning() -> str:
 def sandbox_run(code: str,
                 timeout: float = 30,
                 mem_mb: int = 256,
-                cwd: str | None = None) -> tuple[int, str]:
+                cwd: str | None = None,
+                extra_env: dict | None = None) -> tuple[int, str]:
     """
     在沙盒里执行一段 Python 代码
 
@@ -67,6 +69,13 @@ def sandbox_run(code: str,
     POSIX (Linux/macOS): rlimit 限内存/CPU/句柄，start_new_session + killpg 杀进程组
     其他: subprocess + timeout (best-effort，会在输出里显式告警)
 
+    :param cwd: 子进程工作目录；None = 自建临时目录（默认隔离）。
+                传工作区路径可让脚本用相对路径读写仓库，
+                内存/CPU/超时/进程树/环境清理这些隔离项**不受影响**
+                （安全主体是 L1 预检 + L3 限额，cwd 只影响可见文件范围）。
+    :param extra_env: 在内置环境清理（剥 KEY/TOKEN/SECRET）**之后**额外注入的变量，
+                      典型用法 {"PYTHONPATH": <workspace>} 让脚本能 import 项目模块。
+                      注意：这里注入的值不做敏感词过滤，只接受调用方（工具层）控制的值。
     :return: (exit_code, 合并后的 stdout/stderr)
     """
     owned_cwd = cwd is None
@@ -80,7 +89,9 @@ def sandbox_run(code: str,
             _rmtree(cwd)
         return -1, t(f"安全检查失败: {msg}", f"safety check failed: {msg}")
 
-    env = _clean_env()
+    env = child_utf8_env(_clean_env())
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items()})
 
     try:
         if _HAS_WIN32:
@@ -145,6 +156,56 @@ def _clean_env(env: dict | None = None) -> dict:
     return base
 
 
+# 强制子进程用 UTF-8 说话（Windows 专属坑：stdout 是管道而非 tty 时，
+# Python 按 ANSI codepage / cp936 写字节，我们却按 utf-8 解码，中文就成了 "����"）。
+# PYTHONIOENCODING 管 sys.stdout/stderr，PYTHONUTF8 顺带把 open() 默认编码
+# 也拉成 UTF-8，免得子进程去读工作区里的 UTF-8 文件时按 GBK 崩掉。
+_UTF8_ENV = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
+def child_utf8_env(base: dict | None = None) -> dict:
+    """在给定环境（默认 os.environ）上钉住子进程的 UTF-8 IO 编码
+
+    sandbox_run 用它包住 _clean_env()；run_command 不清理环境
+    （git/pytest 要保留用户凭据），但同样需要这道编码保险。
+    """
+    env = dict(os.environ if base is None else base)
+    env.update(_UTF8_ENV)
+    return env
+
+
+def decode_output(raw: bytes) -> str:
+    """把子进程原始字节解成 str（多编码兜底，不靠猜）
+
+    顺序有讲究：utf-8 校验最强，先严格试；失败说明输出不是 UTF-8
+    （典型是 Windows 上没吃到 _UTF8_ENV 的孙进程吐 GBK），退回本机
+    locale 编码；仍失败才用 replace 兜底，保证函数永不抛异常。
+    """
+    if not raw:
+        return ""
+    for enc in ("utf-8", locale.getpreferredencoding(False)):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _write_script(code: str) -> tuple[str, str]:
+    """把待执行代码写到独立临时目录，返回 (脚本所在目录, 脚本路径)
+
+    刻意不写进 cwd：当 cwd 指向工作区（run_python 的 workdir="workspace"）时，
+    早先把 sandbox_*.py 落在 cwd 里会在用户仓库留下瞬时脏文件，
+    只读文件系统上还会直接失败。目录名带 sandbox_ 前缀，
+    异常退出后能被 clean_stale_sandboxes() 扫掉。
+    """
+    script_dir = tempfile.mkdtemp(prefix="sandbox_")
+    script = os.path.join(script_dir, f"run_{uuid.uuid4().hex}.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(code)
+    return script_dir, script
+
+
 def _run_with_job_object(code: str, timeout: float, mem_mb: int,
                          cwd: str, env: dict) -> tuple[int, str]:
     """Windows Job Object 沙箱执行"""
@@ -169,17 +230,15 @@ def _run_with_job_object(code: str, timeout: float, mem_mb: int,
         hJob, win32job.JobObjectBasicUIRestrictions, ui_limit)
 
     # 写临时脚本（uuid 后缀避免与本模块 sandbox.py 撞名，防子进程误 import 自身）
-    script = os.path.join(cwd, f"sandbox_{uuid.uuid4().hex}.py")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(code)
+    script_dir, script = _write_script(code)
 
     # 启动子进程（带清理后的 env）
     proc = subprocess.Popen(
         [sys.executable, script],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8", errors="replace",
+        # 收字节而非 text：编码在 decode_output() 里按 utf-8 → locale 兜底判定，
+        # 固定 encoding="utf-8" 会直接放弃非 UTF-8 输出（见 _UTF8_ENV 注释）
         cwd=cwd,
         env=env,
     )
@@ -205,18 +264,15 @@ def _run_with_job_object(code: str, timeout: float, mem_mb: int,
                 proc.kill()
         else:
             proc.kill()
-        out = "SANDBOX TIMEOUT"
+        out = b"SANDBOX TIMEOUT"
     finally:
         try:
             win32api.CloseHandle(hJob)
         except Exception:
             pass
-        try:
-            os.unlink(script)
-        except OSError:
-            pass
+        _rmtree(script_dir)
 
-    return proc.returncode, out
+    return proc.returncode, decode_output(out)
 
 
 def _resolve_mem_limit(mem_mb: int | None) -> tuple[int, str]:
@@ -280,9 +336,7 @@ def _run_with_rlimit(code: str, timeout: float, mem_mb: int,
          第一个 Popen 直接 EAGAIN，表现为「沙箱看起来坏了」。防 fork 炸弹
          应交给 cgroup pids.max。
     """
-    script = os.path.join(cwd, f"sandbox_{uuid.uuid4().hex}.py")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(code)
+    script_dir, script = _write_script(code)
 
     mem_bytes, limit_note = _resolve_mem_limit(mem_mb)
     cpu_seconds = max(1, int(math.ceil(timeout)) + 1)
@@ -312,8 +366,6 @@ def _run_with_rlimit(code: str, timeout: float, mem_mb: int,
         [sys.executable, script],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8", errors="replace",
         cwd=cwd,
         env=env,
         start_new_session=True,
@@ -329,16 +381,13 @@ def _run_with_rlimit(code: str, timeout: float, mem_mb: int,
         try:
             out, _ = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            out = ""
+            out = b""
     finally:
         # 正常结束也可能留下后台孙进程，统一收尾（进程组已消失时是 no-op）
         _kill_process_group(proc.pid)
-        try:
-            os.unlink(script)
-        except OSError:
-            pass
+        _rmtree(script_dir)
 
-    out = out or ""
+    out = decode_output(out)
     if limit_note:
         out = f"{out}\n{limit_note}" if out else limit_note
 
@@ -354,17 +403,13 @@ def _run_fallback(code: str, timeout: float, mem_mb: int,
     此路径**无法落实 mem_mb**，因此在输出里显式告警，避免用户误以为有内存限制。
     POSIX 上仍用 start_new_session + killpg 回收进程组，避免孙进程泄漏。
     """
-    script = os.path.join(cwd, f"sandbox_{uuid.uuid4().hex}.py")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(code)
+    script_dir, script = _write_script(code)
 
     posix = os.name == "posix"
     proc = subprocess.Popen(
         [sys.executable, script],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8", errors="replace",
         cwd=cwd,
         env=env,
         start_new_session=True if posix else False,
@@ -382,16 +427,13 @@ def _run_fallback(code: str, timeout: float, mem_mb: int,
         try:
             out, _ = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            out = ""
+            out = b""
     finally:
         if posix:
             _kill_process_group(proc.pid)
-        try:
-            os.unlink(script)
-        except OSError:
-            pass
+        _rmtree(script_dir)
 
-    out = out or ""
+    out = decode_output(out)
     if timed_out:
         return -1, "SANDBOX TIMEOUT\n" + _no_limit_warning()
     return proc.returncode, f"{out}\n{_no_limit_warning()}" if out else _no_limit_warning()
