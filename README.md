@@ -259,7 +259,6 @@ vil-agent config set lang en     # 写入 ~/.vil/config.json
 - `permission_decision`（L2 决策：name / action）
 - `intent_summary`（`run_command` / `run_python` 需要确认时的意图总结：name / summary。仅 `permission_summary=true` 且走到 ask 时触发）
 - `permission_warning`（规则文件加载失败等权限告警：message；不阻断循环）
-- `permission_remembered`（确认框选「总是允许」的结果：name / pattern / path / saved / error；`saved=false` 表示没写成，`error` 说明原因）
 - `llm_response`（每步：step / latency_s / usage）
 - `stats`（收尾：steps / elapsed_s / usage 累加 + `status` 字段，reasoning 为 completion 子集单列；中断时 status="interrupted"，含已完成步数与部分 token 统计）
 - `loop_detected`（连续 3 步相同 tool_calls 签名：step / pattern）
@@ -347,8 +346,6 @@ def my_tool(foo: str, _ctx=None) -> str:
   格式：`{"rules":[{"tool":"run_command","pattern":"git *","action":"allow"}]}`，fnmatch 对 `args["path"]` / `args["command"]` / `args["code"]` **逐个匹配，命中任一即算**。
   
   例：`{"tool":"run_command","action":"allow"}`（省略 `pattern`）可把该工具所有调用整体放行（充分自动化）；`{"tool":"write_file","pattern":"src/**","action":"deny"}` 可反向收紧。
-
-  **记住批准**（交互式确认时在 `[y/N/a=总是允许]` 里选 `a`）：把**本次调用的字面量**写成一条 `allow` 规则（`run_command` 记 `command`、`delete_file`/`write_file`/`edit_file` 记 `path`），fnmatch 元字符会被转义，语义严格是「下次完全相同的调用免确认」——不做前缀/通配放宽（否则批准一个命令等于批准一族命令）。规则写入当前生效的规则文件（项目 `.vil/permissions.json` 存在就写项目，否则写 `~/.vil/permissions.json`），原子替换落盘，并在内存里插到规则表最前面（压过此前更宽的 ask/deny 规则）。两条边界：① 文件解析失败时**拒绝写入**，不覆盖用户手写的规则；② 内置 deny 硬底线仍在用户规则之前，所以「记住」不可能把危险命令/高危代码变成放行。`run_python` 不支持记住——代码块每次几乎都不同，按整段代码精确匹配既难命中又会撑大规则文件（纯计算本就由 `auto` 层级的 `safe_python` 白名单覆盖）。
 
   `action="ask"` 时调用 `permission_handler`（由调用方提供，如 CLI 交互输入）。
 - **L3 `sandbox_run(code, timeout, mem_mb, cwd, extra_env)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
@@ -495,7 +492,7 @@ sessions/
 - **Rich markup `\[tag]` 转义**：所有字面方括号（`[session]`/`[history]` 等）用 `\[xxx]` 转义，避免被 Rich 误解析为 markup 标签而消失
 - **`file_diff` 渲染**：`write_file`/`delete_file` 覆盖模式自动生成 unified diff，用 `Syntax("diff")` + `Panel` 渲染给用户（LLM 不见，省 token）
 - **`<new_task/>` 静默过滤**：渲染时 `content.replace("<new_task/>", "")`，不显示给用户（前端 repl_loop 检测原始 content 触发提示）
-- **权限交互**：`prompt_permission(req)` 弹 `Panel` + `允许执行? [y/N/a=总是允许] >`（`a` 只在支持记住的工具上出现），返回 `allow`/`deny`；选 `a` 时在 `req` 上打 `remember=True`，由 `AgentLoop` 调 `PermissionSystem.remember()` 落盘并回显 `permission_remembered` 事件；EOFError/KeyboardInterrupt 一律 `deny`。面板里展示 `risk` 与（`run_command` 的）`summary`（模型生成的命令意图，见 L2 权限层）
+- **权限交互**：`prompt_permission(req)` 弹 `Panel` + `允许执行? [y/N] >`（提示符含 `[y/N]` 需 `escape` 转义，否则被 rich 当 style tag），返回 `allow`/`deny`；EOFError/KeyboardInterrupt 一律 `deny`。面板里展示 `risk` 与（`run_command` 的）`summary`（模型生成的命令意图，见 L2 权限层）
 
 `SESSIONS_DIR = Path(os.environ.get("VIL_SESSIONS_DIR") or (Path.home() / ".vil" / "sessions"))`，可设环境变量覆盖（测试/多实例隔离用）。
 

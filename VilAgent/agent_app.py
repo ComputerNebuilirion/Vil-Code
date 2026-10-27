@@ -29,7 +29,6 @@ from .input_line import read_line
 from .llm import LLMClient
 from .loop import AgentLoop
 from .safety import clean_stale_sandboxes
-from .safety.permissions import remember_pattern
 from .session import SessionManager
 from .state import State
 
@@ -338,19 +337,6 @@ class TerminalView:
     async def _on_permission_warning(self, e):
         console.print(Text(f"  ⚠ {e.get('message', '')}", style="bold yellow"))
 
-    async def _on_permission_remembered(self, e):
-        """「总是允许」的结果回显：写进哪个文件 / 为什么没写成"""
-        if e.get("saved"):
-            line = Text("  ✓ ", style="green")
-            line.append(t("已记住: ", "remembered: "), style="dim")
-            line.append(f"{e.get('name')} ← {e.get('pattern')}", style="dim")
-            console.print(line)
-            console.print(Text(f"    → {e.get('path', '')}", style="dim"))
-        else:
-            console.print(Text(
-                t(f"  ⚠ 未能记住: {e.get('error')}", f"  ⚠ not remembered: {e.get('error')}"),
-                style="yellow"))
-
     async def _on_tool_result(self, e):
         r = e["result"]
         preview = r[:200] + ("…" if len(r) > 200 else "")
@@ -453,14 +439,8 @@ class TerminalView:
                            title=t("权限请求", "permission request"), title_align="left"))
         # 读输入前先停掉 spinner：rich 的 Status 刷新线程会和行编辑器的重绘抢终端
         self._stop_thinking()
-        # 「记住批准」选项只在主字段能稳定匹配时给（见 permissions.remember_pattern）：
-        # run_python 的代码块每次不同，记住它既难命中又会让规则文件膨胀
-        rememberable = remember_pattern(tool, args) is not None
-        if rememberable:
-            prompt_markup = f"[bold]{escape(t('  允许执行? [y/N/a=总是允许] > ', '  Allow? [y/N/a=always] > '))}[/bold]"
-        else:
-            # 提示符里有 [y/N]，必须转义，否则会被 rich 当成 style tag
-            prompt_markup = f"[bold]{escape(t('  允许执行? [y/N] > ', '  Allow? [y/N] > '))}[/bold]"
+        # 提示符里有 [y/N]，必须转义，否则会被 rich 当成 style tag
+        prompt_markup = f"[bold]{escape(t('  允许执行? [y/N] > ', '  Allow? [y/N] > '))}[/bold]"
         try:
             # 用共享的跨平台输入行（裸 input() 在 Linux/WSL 下方向键会变成 ^[[D）
             ans = await asyncio.to_thread(read_line, prompt_markup, console)
@@ -468,8 +448,4 @@ class TerminalView:
             console.print()
             return "deny"
         ans = ans.strip().lower()
-        if rememberable and ans in ("a", "always", "all", "总是"):
-            # 交给 loop 落盘（View 不写文件，只表达用户意图）
-            req["remember"] = True
-            return "allow"
         return "allow" if ans in ("y", "yes") else "deny"
