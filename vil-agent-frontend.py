@@ -47,6 +47,7 @@ from VilAgent.config import (
 )
 from VilAgent.i18n import t, set_lang, get_lang
 from VilAgent.input_line import read_line
+from VilAgent.safety import normalize_level, level_label
 
 
 # —— 常驻事件循环 ——
@@ -129,6 +130,9 @@ REPL 命令:
   /delete <id>           永久删除会话（需确认，默认当前）
   /deleteall             永久删除所有会话（需确认）
   /mode \\[ask|do|review]  查看/切换默认 mode
+  /perm \\[strict|balanced|auto]
+                         查看/切换权限层级（strict=所有非只读都要确认，
+                         balanced=只有命令/删除类需确认，auto=低风险命令直接放行）
   /tokens                显示当前会话累计 token
   /title \\[force]         用 LLM 生成/重生成当前会话标题（/sessions 里显示）
   /title all [--dry-run]  批量重生成所有会话标题（老标题一次性迁移；dry-run 只预览）
@@ -160,6 +164,10 @@ Session commands:
   /delete <id>           permanently delete a session (confirm; current by default)
   /deleteall             permanently delete all sessions (confirmation required)
   /mode \\[ask|do|review]  view / switch the default mode
+  /perm \\[strict|balanced|auto]
+                         view / switch the permission level (strict = confirm every
+                         non-readonly action, balanced = only command/delete actions,
+                         auto = low-risk commands run directly)
   /tokens                show cumulative tokens of the current session
   /title \\[force]         generate/regenerate a title for the current session
                          (shown by /sessions)
@@ -198,6 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help=t("最大步数（默认 50）", "Max steps (default 50)"))
     p.add_argument("--no-stream", action="store_true",
                    help=t("关闭流式输出", "Disable streaming output"))
+    p.add_argument("--permission", dest="permission", default=None,
+                   choices=["strict", "balanced", "auto"],
+                   help=t(
+                       "权限层级：strict=所有非只读操作都要确认；"
+                       "balanced=只有命令/删除类操作需确认（默认）；"
+                       "auto=低风险命令直接放行，中/高风险才确认",
+                       "permission level: strict=confirm every non-readonly action; "
+                       "balanced=only command/delete actions need confirmation (default); "
+                       "auto=low-risk commands run directly, medium/high ask"))
     return p
 
 
@@ -514,6 +531,9 @@ def repl_loop(model: AgentModel, view: TerminalView,
                args: argparse.Namespace) -> None:
     default_mode = args.mode
     cfg = model.cfg
+    # 权限层级：--permission 优先，否则读配置（/perm 可在运行时切换，仅本次运行）
+    perm_level = normalize_level(
+        getattr(args, "permission", None) or cfg.get("permission_level"))
 
     while True:
         # 提示符：[sid] (mode) >
@@ -776,6 +796,26 @@ def repl_loop(model: AgentModel, view: TerminalView,
                 _console.print(t(f"{_tag('error')} 未知 mode: {parts[1]}",
                                  f"{_tag('error')} unknown mode: {parts[1]}"))
             continue
+        if line == "/perm" or line.startswith("/perm "):
+            parts = line.split()
+            if len(parts) == 1:
+                _console.print(t(f"当前权限层级: {perm_level} — {level_label(perm_level)}",
+                                 f"current permission level: {perm_level} — {level_label(perm_level)}"))
+                _console.print(t(
+                    "[dim]用法: /perm strict|balanced|auto（仅本次运行生效；"
+                    "持久化请用 /config set permission_level auto）[/dim]",
+                    "[dim]usage: /perm strict|balanced|auto (this run only; "
+                    "persist with /config set permission_level auto)[/dim]"))
+            elif parts[1].lower() in ("strict", "balanced", "auto"):
+                perm_level = normalize_level(parts[1])
+                _console.print(t(f"权限层级 → {perm_level} — {level_label(perm_level)}",
+                                 f"permission level → {perm_level} — {level_label(perm_level)}"))
+            else:
+                _console.print(t(
+                    f"{_tag('error')} 未知权限层级: {parts[1]}（strict/balanced/auto）",
+                    f"{_tag('error')} unknown permission level: {parts[1]} "
+                    f"(strict/balanced/auto)"))
+            continue
         if line.startswith("/switch "):
             new_sid = line[len("/switch "):].strip()
             if not sm.get(new_sid):
@@ -834,6 +874,7 @@ def repl_loop(model: AgentModel, view: TerminalView,
             state=state,
             session_id=sid,
             session_manager=sm,
+            permission_level=perm_level,
         )
         sm.update(sid, mode=mode, status="active")
         view.reset_for_new_run()
@@ -1010,6 +1051,9 @@ def _render_banner(console, sm, sid: str, resumed: bool, args) -> None:
     ws = Path.cwd()
     mode = (sm.get(sid) or {}).get("mode") or args.mode or "ask"
     mode_color = "bold green" if mode == "ask" else ("bold red" if mode == "do" else "bold yellow")
+    perm = normalize_level(getattr(args, "permission", None) or cfg.get("permission_level"))
+    perm_color = {"strict": "bold red", "balanced": "bold yellow",
+                  "auto": "bold green"}.get(perm, "bold yellow")
     max_steps = args.max_steps or cfg.get("max_steps") or 50
     llm = cfg.get("llm", {}) or {}
     model_name = llm.get("model") or "?"
@@ -1030,10 +1074,12 @@ def _render_banner(console, sm, sid: str, resumed: bool, args) -> None:
     right = Text(f"v{_ver}", style="dim")
     lines.append(_justify_row(logo, right, width=panel_width))
 
-    # 2. 模式 chip（ask=绿 do=红 review=黄）
+    # 2. 模式 chip（ask=绿 do=红 review=黄）+ 权限层级 chip（strict=红 balanced=黄 auto=绿）
     mode_line = Text()
     mode_line.append("  mode:  ", style="dim")
     mode_line.append(mode.upper().ljust(6), style=mode_color)
+    mode_line.append("  perm: ", style="dim")
+    mode_line.append(perm.upper(), style=perm_color)
     lines.append(mode_line)
 
     # 3. cwd

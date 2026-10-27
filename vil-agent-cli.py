@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 from VilAgent import SessionManager, State, load_config, set_value, get_value, CONFIG_FILE
+from VilAgent import normalize_level
 from VilAgent.agent_app import (
     AgentModel, TerminalView,
     SESSIONS_DIR as _SESSIONS_DIR,
@@ -59,6 +60,15 @@ def _add_mode_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--new", dest="new_session", action="store_true",
                     help=t("强制新建 session（不续接上次）",
                            "force a new session (do not resume the last one)"))
+    sp.add_argument("--permission", dest="permission", default=None,
+                    choices=["strict", "balanced", "auto"],
+                    help=t(
+                        "权限层级：strict=所有非只读操作都要确认；"
+                        "balanced=只有命令/删除类操作需确认（默认）；"
+                        "auto=低风险命令直接放行，中/高风险才确认",
+                        "permission level: strict=confirm every non-readonly action; "
+                        "balanced=only command/delete actions need confirmation (default); "
+                        "auto=low-risk commands run directly, medium/high ask"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,12 +214,18 @@ async def run_agent(args: argparse.Namespace) -> None:
     # State 路径指向该 session 的独立 jsonl 文件
     state = State(sm.path_for(sid))
 
+    perm_level = normalize_level(
+        getattr(args, "permission", None) or cfg.get("permission_level"))
+    _console.print(t(f"[dim]\\[permission] 层级 {perm_level}[/dim]",
+                     f"[dim]\\[permission] level {perm_level}[/dim]"))
+
     agent = model.build_agent(
         mode=mode, trust=trust, stream=stream,
         max_steps=max_steps, permission_handler=view.prompt_permission,
         state=state,
         session_id=sid,
         session_manager=sm,
+        permission_level=perm_level,
     )
 
     # 联合 callback：view 渲染 + 把最终 stats / summary 写回 session

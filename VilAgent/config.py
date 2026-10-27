@@ -30,6 +30,13 @@ DEFAULTS: dict = {
     "context_budget": 8000,
     # 输出语言：cn（中文）/ en（英文）；见 VilAgent/i18n.py
     "lang": "cn",
+    # 权限层级（见 safety/permissions.py）：
+    #   strict   所有非只读操作都要用户确认
+    #   balanced 只有命令/代码执行 + 删除类工具需要确认（默认）
+    #   auto     静态检查 risk=low 的 run_command 直接放行，medium/high 才确认
+    "permission_level": "balanced",
+    # 需要用户确认 run_command 时，是否调一次模型总结该命令的目的（提示给人看）
+    "permission_summary": True,
 }
 
 

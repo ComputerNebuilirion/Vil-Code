@@ -1,4 +1,5 @@
 """Agent 执行循环：ReAct（Reason + Act）"""
+import asyncio
 import functools
 import json
 import time
@@ -11,6 +12,7 @@ from .llm import LLMClient, LLMError
 from .safety import classify, classify_command
 from .safety.permissions import (
     PermissionSystem, default_rules_file, ALLOW, ASK, DENY,
+    DEFAULT_LEVEL, normalize_level,
 )
 from .session import (
     SessionManager, _TITLE_MAX_EN, _TITLE_MAX_ZH,
@@ -23,6 +25,114 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 # 工具结果喂回 LLM 前的字符上限（head+tail，避免单步超大输出撑爆上下文）
 _TOOL_RESULT_MAX_CHARS = 4000
+
+# 需要人工确认时，额外做一次小 LLM 调用告诉用户「这一步想干什么」
+# 目前覆盖 run_command（命令）与 run_python（代码）两条执行路径
+_SUMMARY_TIMEOUT_S = 15.0
+_SUMMARY_MAX_CHARS = 300
+_SUMMARY_TASK_HINT_CHARS = 400
+# 待总结的主体（命令/代码）截断上限：run_python 的代码可能上千行，
+# 小模型看 head+tail 就足够说清意图，不必把整个脚本灌进去
+_SUMMARY_SUBJECT_MAX_CHARS = 2000
+
+# 总结对象 → 提示词里的称呼
+_SUMMARY_KIND_CODE = "code"
+
+
+def _summary_system_prompt(kind: str) -> str:
+    """按总结对象选提示词：命令看「会改动什么」，代码看「算什么 / 读写什么」"""
+    if kind == _SUMMARY_KIND_CODE:
+        return t(
+            "你是 Python 代码意图解释器。用户即将手动确认一段代码是否可以在沙箱里执行，"
+            "请用一两句话说明这段代码要实现的目的（算什么、会不会读写文件或访问网络），"
+            "不要复述代码本身，不要评价风险，不要给优化建议。只输出这一两句话。",
+            "You explain Python code intent. The user is about to approve running "
+            "this code in a sandbox; in one or two sentences say what it aims to "
+            "achieve (what it computes, whether it reads/writes files or uses the "
+            "network). Do not restate the code, do not rate risk, do not suggest "
+            "improvements. Output only that summary.",
+        )
+    return t(
+        "你是 shell 命令意图解释器。用户即将手动确认一条命令是否可以执行，"
+        "请用一两句话说明这条命令要实现的目的（做什么、会改动哪些文件或环境），"
+        "不要复述命令本身，不要评价风险，不要给建议。只输出这一两句话。",
+        "You explain shell command intent. The user is about to approve this "
+        "command; in one or two sentences say what it aims to achieve (what it "
+        "does, which files or environment it touches). Do not restate the "
+        "command, do not rate risk, do not give advice. Output only that summary.",
+    )
+
+
+def _build_intent_summary_messages(subject: str, kind: str = "command",
+                                   risk: str | None = None,
+                                   task_hint: str = "",
+                                   extra: str = "") -> list[dict]:
+    """构造「意图总结」的 messages（纯函数，便于单测）
+
+    :param subject: 待确认的命令或代码
+    :param kind: "command" / "code"（决定提示词与称呼）
+    :param risk: 静态检查评级，给模型当上下文
+    :param task_hint: 当前任务，避免模型脱离上下文瞎猜
+    :param extra: 额外上下文（如 run_python 的沙箱工作目录），一行一条
+    """
+    parts = []
+    if task_hint:
+        parts.append(t(f"当前任务: {task_hint}", f"current task: {task_hint}"))
+    if risk:
+        parts.append(t(f"静态检查评级: {risk}", f"static risk rating: {risk}"))
+    if extra:
+        parts.append(extra)
+    body = _truncate_tool_result(str(subject), _SUMMARY_SUBJECT_MAX_CHARS)
+    if kind == _SUMMARY_KIND_CODE:
+        parts.append(t(f"待确认代码:\n{body}", f"code awaiting approval:\n{body}"))
+    else:
+        parts.append(t(f"待确认命令:\n{body}", f"command awaiting approval:\n{body}"))
+    return [
+        {"role": "system", "content": _summary_system_prompt(kind)},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+
+def _build_command_summary_messages(command: str, risk: str | None = None,
+                                    task_hint: str = "") -> list[dict]:
+    """构造「命令意图总结」的 messages（run_command 用，纯函数）"""
+    return _build_intent_summary_messages(str(command), "command", risk, task_hint)
+
+
+def _build_code_summary_messages(code: str, risk: str | None = None,
+                                 task_hint: str = "",
+                                 extra: str = "") -> list[dict]:
+    """构造「代码意图总结」的 messages（run_python 用，纯函数）"""
+    return _build_intent_summary_messages(
+        str(code), _SUMMARY_KIND_CODE, risk, task_hint, extra)
+
+
+def _python_summary_context(args: dict) -> str:
+    """run_python 的沙箱参数直接决定「代码会碰到什么」，作为总结上下文
+
+    workdir 是最关键的一项：同样的代码，workspace 会真实改动仓库文件，
+    sandbox 则碰不到。不告诉模型，它会按最坏/最好的情况瞎猜。
+    """
+    workdir = str(args.get("workdir") or "").strip().lower()
+    if workdir in ("workspace", "ws", "repo", "project"):
+        wd = t("沙箱工作目录: 工作区（相对路径会真实读写仓库文件）",
+               "sandbox cwd: the workspace (relative paths really read/write repo files)")
+    else:
+        wd = t("沙箱工作目录: 系统临时目录（碰不到仓库文件）",
+               "sandbox cwd: a temp dir (cannot touch repo files)")
+    notes = [wd]
+    if args.get("timeout") or args.get("mem_mb"):
+        bits = []
+        if args.get("timeout"):
+            bits.append(f"timeout={args['timeout']}s")
+        if args.get("mem_mb"):
+            bits.append(f"mem={args['mem_mb']}MB")
+        notes.append(t(f"限额: {', '.join(bits)}", f"limits: {', '.join(bits)}"))
+    return "\n".join(notes)
+
+
+# 需要做「意图总结」的工具：都是执行类，确认成本高，用户值得先看懂想干什么
+_SUMMARY_TOOLS = {"run_command", "run_python"}
 
 
 def _truncate_tool_result(text: str, max_chars: int = _TOOL_RESULT_MAX_CHARS) -> str:
@@ -180,6 +290,8 @@ class AgentLoop:
         stream: bool = False,
         permission_handler: Callable[[dict], Awaitable[str]] | None = None,
         permissions_file: Path | str | None = None,
+        permission_level: str | None = None,
+        permission_summary: bool | None = None,
         context_budget: int | None = None,
         session_id: str = "",
         session_manager: SessionManager | None = None,
@@ -211,17 +323,23 @@ class AgentLoop:
 
         # L2 权限系统：显式传入优先，否则自动解析 <workspace>/.vil/permissions.json
         # 或 ~/.vil/permissions.json（让规则文件真正生效）；空串也走默认解析
+        # level 决定默认姿态（strict / balanced / auto，见 safety/permissions.py）
         if not permissions_file:
             permissions_file = default_rules_file(context.workspace)
+        self.permission_level = normalize_level(permission_level or DEFAULT_LEVEL)
         self.permissions = PermissionSystem(
-            rules_file=permissions_file, trust=self.trust
+            rules_file=permissions_file, trust=self.trust,
+            level=self.permission_level,
         )
+        # 只在「需要用户确认」时调模型总结命令目的（关掉可省一次 LLM 调用）
+        self.permission_summary = True if permission_summary is None else bool(permission_summary)
 
         # 运行时上下文，透传给工具函数（_ctx 参数）
         self._ctx = {
             "workspace": str(context.workspace),
             "trust": self.trust,
             "mode": self.mode,
+            "permission_level": self.permission_level,
             "session_id": session_id,
             "sessions_dir": str(session_manager.dir) if session_manager else "",
         }
@@ -393,11 +511,32 @@ class AgentLoop:
                     action = self.permissions.evaluate(
                         name, args, readonly=readonly, risk=risk
                     )
-                    if action == ASK and self.permission_handler:
-                        action = await self.permission_handler({
-                            "tool": name, "args": args,
-                            "risk": risk, "proposed": ASK,
-                        })
+                    if action == ASK:
+                        req = {"tool": name, "args": args,
+                               "risk": risk, "proposed": ASK}
+                        # 仅「需要用户确认的执行类工具」才花一次模型调用，
+                        # 告诉用户这段命令/代码想干什么（放行/拒绝路径都不调）
+                        if name in _SUMMARY_TOOLS and self.permission_summary:
+                            if name == "run_python":
+                                subject = args.get("code", "")
+                                extra = _python_summary_context(args)
+                            else:
+                                subject = args.get("command", "")
+                                extra = ""
+                            summary = await self._summarize_intent(
+                                name, subject, risk,
+                                task_hint=task, extra=extra,
+                            )
+                            if summary:
+                                req["summary"] = summary
+                                await self._emit(callback, {
+                                    "event": "intent_summary", "name": name,
+                                    "summary": summary,
+                                })
+                        if self.permission_handler:
+                            action = await self.permission_handler(req)
+                        else:
+                            action = DENY
                     await self._emit(callback, {
                         "event": "permission_decision",
                         "name": name, "action": action,
@@ -458,6 +597,45 @@ class AgentLoop:
                 # 输出、异常穿透到前端 UI 状态不一致（spinner 泄漏）。
                 pass
             return "(user interrupted)"
+
+    async def _summarize_intent(self, tool: str, subject: str,
+                                risk: str | None = None,
+                                task_hint: str = "", extra: str = "") -> str:
+        """需要人工确认 run_command / run_python 时，用一次小模型调用总结其目的。
+
+        纯粹给别人看（权限面板），所以：
+        - 失败/超时一律静默返回空串，绝不阻断确认流程
+        - 不产生 tool_msg、不进对话历史、不参与循环检测
+        - 调用前后恢复 llm.last_usage / last_latency，避免污染本轮统计
+        """
+        if not subject or not str(subject).strip() or self.llm is None:
+            return ""
+        kind = _SUMMARY_KIND_CODE if tool == "run_python" else "command"
+        hint = " ".join(str(task_hint or "").split())[:_SUMMARY_TASK_HINT_CHARS]
+        saved_usage, saved_latency = self.llm.last_usage, self.llm.last_latency
+        text = ""
+        try:
+            resp = await asyncio.wait_for(
+                self.llm.chat(
+                    messages=_build_intent_summary_messages(
+                        str(subject), kind, risk, hint, extra),
+                    tools=None, stream=False,
+                ),
+                timeout=_SUMMARY_TIMEOUT_S,
+            )
+            text = str(resp.get("content") or "").strip()
+        except Exception:
+            # 总结只是锦上添花：LLM 挂了/超时/格式异常都不能挡住权限确认
+            text = ""
+        finally:
+            self.llm.last_usage, self.llm.last_latency = saved_usage, saved_latency
+        return " ".join(text.split())[:_SUMMARY_MAX_CHARS]
+
+    async def _summarize_command(self, command: str, risk: str | None = None,
+                                 task_hint: str = "") -> str:
+        """run_command 专用的兼容别名（内部走 _summarize_intent）"""
+        return await self._summarize_intent(
+            "run_command", command, risk, task_hint)
 
     @staticmethod
     def _compute_step_signature(tool_calls: list[dict]) -> str:

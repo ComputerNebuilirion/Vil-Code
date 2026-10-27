@@ -146,6 +146,8 @@ vil-agent review 审查 VilAgent/loop.py
 vil-agent do --new 隔离执行不相关任务          # 不续接上次会话
 vil-agent do --continue <session_id> 续接指定会话
 vil-agent ask --no-stream --max-steps 10 快速看一眼
+vil-agent do --permission strict 每步都要我确认
+vil-agent do --permission auto 低风险命令别来烦我
 ```
 
 **多轮 REPL（frontend）**——模式是 flag，默认 `ask`：
@@ -155,6 +157,7 @@ python vil-agent-frontend.py                      # 默认 ask 模式
 python vil-agent-frontend.py --mode do            # 允许写操作
 python vil-agent-frontend.py --mode review
 python vil-agent-frontend.py --new                # 强制新会话
+python vil-agent-frontend.py --permission auto    # 权限层级（也可 REPL 内 /perm 切换）
 ```
 
 REPL 内 `/help` 查看全部斜杠命令，`/exit` 退出，Ctrl+C 中止当前任务但保留会话。
@@ -217,7 +220,7 @@ set_value("llm.api_key", "sk-...")   # 只存全局，绝不进项目文件
 cfg = load_config()                  # 与 DEFAULTS 深合并
 ```
 
-`DEFAULTS`：`llm.{endpoint,model,api_key,temperature(0.2),max_retries(3),retry_base_delay(0.5)}`、`stream(true)`、`default_mode(ask)`、`max_steps(50)`、`max_steps_total(200)`、`context_budget(8000=历史超此 token 数自动摘要；置 null 关闭)`、`lang(cn)`。
+`DEFAULTS`：`llm.{endpoint,model,api_key,temperature(0.2),max_retries(3),retry_base_delay(0.5)}`、`stream(true)`、`default_mode(ask)`、`max_steps(50)`、`max_steps_total(200)`、`context_budget(8000=历史超此 token 数自动摘要；置 null 关闭)`、`lang(cn)`、`permission_level(balanced)`、`permission_summary(true=确认执行类工具前用模型生成意图总结)`。
 
 文件只存用户实际设的字段（不把 DEFAULTS 写进文件污染），`load_config` 运行时合并。
 
@@ -254,6 +257,7 @@ vil-agent config set lang en     # 写入 ~/.vil/config.json
 - `tool_result`（含 name、result）
 - `risk_report`（run_python 的 L1 分类 / run_command 的命令分类：risk / cmd_type / reasons；命令仅在命中理由时上报）
 - `permission_decision`（L2 决策：name / action）
+- `intent_summary`（`run_command` / `run_python` 需要确认时的意图总结：name / summary。仅 `permission_summary=true` 且走到 ask 时触发）
 - `permission_warning`（规则文件加载失败等权限告警：message；不阻断循环）
 - `llm_response`（每步：step / latency_s / usage）
 - `stats`（收尾：steps / elapsed_s / usage 累加 + `status` 字段，reasoning 为 completion 子集单列；中断时 status="interrupted"，含已完成步数与部分 token 统计）
@@ -319,7 +323,17 @@ def my_tool(foo: str, _ctx=None) -> str:
 
   硬底线用 `match_dangerous_command()` 对命令做**规范化（小写+折叠空白）+ 正则 search**，可覆盖大小写（`RM -RF /`）、前缀（`sudo rm -rf /`）、拼接（`echo x && rm -rf /`）以及 Windows/PowerShell（`del`/`rd /s`/`format`/`Remove-Item -Recurse`）、Linux 专属（fork 炸弹 `:(){ :|:& };:`、根目录放开权限 `chmod -R 777 /`、裸块设备写入 `> /dev/sda`/`tee /dev/nvme0n1`）等绕过写法（`exec.py` 复用同一匹配器，避免两套口径不一致）。黑名单混合三类平台条目（Unix / Windows cmd / PowerShell），在各自平台上互为死代码但无害，不按平台分层以保持单一口径。
 
-  **默认姿态（trust 模式 / do 模式）**：写/编辑类工具（`write_file`/`edit_file`）自动 **allow**（低摩擦，自动化友好）；命令/代码执行类（`run_command`/`run_python`）**ask** 人工确认；破坏性工具（`delete_file`）因删除不可逆，亦单独 **ask**；`risk=high` 亦 **ask**。非 trust 模式写/执行一律 **deny**。
+  **默认姿态（trust 模式 / do 模式）由用户可选的权限层级 `permission_level` 决定**（CLI/frontend `--permission` 指定，REPL 内 `/perm` 切换，或 `config set permission_level ...` 持久化）：
+
+| 层级 | 行为 | 适用 |
+|---|---|---|
+| `strict` | **所有非只读操作**都要人工确认（`write_file`/`edit_file` 也不例外） | 初次使用、审查陌生仓库 |
+| `balanced`（默认） | 写/编辑类工具 **allow**（低摩擦）；命令/代码执行类（`run_command`/`run_python`）**ask**；破坏性工具（`delete_file`）**ask** | 日常开发 |
+| `auto` | 在 `balanced` 基础上，L1 静态检查 `risk=low` 的 `run_command` / `run_python` **直接 allow**，`risk=medium/high` 才 **ask**（`delete_file` 仍 ask） | 熟悉环境后的自动化 |
+
+  `risk=high` 在任一层级都是 **ask**（危险命令更早已被内置 deny 硬底线拦下），非 trust 模式（`ask`/`review`）写/执行一律 **deny**。层级只影响「默认姿态」，用户规则文件与内置硬底线的优先级不变。
+
+  **确认前的执行意图总结**：`run_command`（命令）或 `run_python`（代码）走到 ask 时，若 `permission_summary=true`（默认），会用**一次小模型调用**生成一两句话，说明「这一步想实现什么」（含当前任务与静态评级作上下文；`run_python` 还会带上沙箱工作目录和限额，因为同样的代码在 `workspace` 下会真实改动仓库、在 `sandbox` 下碰不到），塞进权限请求的 `summary` 字段并 emit `intent_summary` 事件，`TerminalView` 在确认框里以「意图: …」展示。只在**需要确认**时触发——放行/拒绝路径、`permission_summary=false`、或其他工具（如 `write_file`）都不会多花这次调用；总结失败/超时（15s）静默降级为空，不阻断确认流程，也不进对话历史。
 
   **规则文件**（自动加载，无需传参）：优先 `<workspace>/.vil/permissions.json`，其次 `~/.vil/permissions.json`（`permissions_file` 传空串/None 均走此默认解析）；文件损坏时记录告警（`permission_warning` 事件）并忽略，不阻断循环。
 
@@ -328,7 +342,9 @@ def my_tool(foo: str, _ctx=None) -> str:
   例：`{"tool":"run_command","action":"allow"}`（省略 `pattern`）可把该工具所有调用整体放行（充分自动化）；`{"tool":"write_file","pattern":"src/**","action":"deny"}` 可反向收紧。
 
   `action="ask"` 时调用 `permission_handler`（由调用方提供，如 CLI 交互输入）。
-- **L3 `sandbox_run(code, timeout, mem_mb, cwd)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
+- **L3 `sandbox_run(code, timeout, mem_mb, cwd, extra_env)`** → 环境清理剥离 API key/secret；默认在系统临时目录建 `sandbox_*` 目录隔离执行，**用后自动清理**（超时/异常路径也会删）；`clean_stale_sandboxes()` 清扫异常退出残留的旧目录。
+  - `cwd` 可指向工作区（`run_python(workdir="workspace")`）：内存/CPU/超时/进程树/环境清理**照旧生效**，只是脚本可见的文件范围变大。脚本本体始终写在独立临时目录，不会在仓库里留 `sandbox_*.py`。
+  - `extra_env` 在内置环境清理**之后**注入（典型：`PYTHONPATH=<workspace>` 让脚本能 import 项目模块；同时设 `PYTHONDONTWRITEBYTECODE=1`，避免在工作区生成 `__pycache__`）。
   - **Windows（有 pywin32）**：Job Object 限制内存/CPU/UI，超时用 `TerminateJobObject` 杀整个 Job（含后代）。
   - **Linux / macOS**：`resource.setrlimit` 限制 `RLIMIT_AS`（内存，默认 256MB，超限时被测代码拿到 `MemoryError` 可自行交代原因）、`RLIMIT_CPU`（CPU 兜底）、`RLIMIT_NOFILE`（句柄数）；`start_new_session=True` + 超时 `killpg` 回收整个进程组（**含孙进程**，只用 `kill()` 会漏）。
   - 两者都不可用（如 Windows 无 pywin32）→ `subprocess + timeout` best-effort，**且在输出里显式告警「mem_mb 被忽略」**，不静默降级。
@@ -337,6 +353,17 @@ def my_tool(foo: str, _ctx=None) -> str:
 - **路径**：`is_path_safe(path, workspace)` 防止 `..` 越界。
 
 `run_python` 工具串联三层：L1 分类 → L2 权限 → L3 沙箱执行。
+
+### 执行分工：代码走沙箱，命令走 shell
+
+```
+写代码验证/计算/试跑  →  run_python(code=..., workdir="workspace"|"sandbox")
+项目自身的命令        →  run_command("pytest -q" / "git status" / ...)
+```
+
+- `run_python` 是**执行 Python 的首选路径**：`workdir="workspace"` 让脚本以工作区为 cwd（可用相对路径、能 import 项目模块），`workdir="sandbox"`（默认）落在临时目录。两种模式都保留内存上限 / 超时杀进程树 / 敏感环境变量剥离。
+- `run_command` 不再是执行代码的通道：`python -c "..."`、`python - <<EOF`、`echo ... | python -` 这类内联执行**直接拦截**并引导回 `run_python`（否则沙箱形同虚设）；执行 `.py` 脚本文件仍然放行（项目 CLI / pytest 等合法用法），但结果里会追加一行提示，把「先 write_file 造临时脚本再跑」的习惯掰回沙箱。
+- `run_command` 现在会回传非 0 退出码（`[exit=N]`），并在超时时用进程组 / `taskkill /T` 回收**整棵进程树**——早先只 `kill()` 直接子进程，`python long_task.py` 超时后仍在写仓库。
 
 ## 状态
 
@@ -432,6 +459,7 @@ sessions/
 | `/title all [--dry-run]` | 批量重生成所有会话标题（老标题一次性迁移），`--dry-run` 只预览不写盘 |
 | `/compress [all]` | 手动摘要压缩：调 LLM 把当前会话旧历史压成摘要缓存（保留最近 10 条原文），`all` 忽略缓存强制重生成；无需 `context_budget` 即可生效 |
 | `/export [sid] [-o f]` | `export_markdown()` 导出为 .md（默认当前会话，支持 `-o` 指定路径） |
+| `/perm [strict\|balanced\|auto]` | 查看/切换权限层级（仅本次运行生效；持久化用 `/config set permission_level auto`） |
 | `/config` | 修改 `~/.vil/config.json`（详见下文「配置」） |
 
 启动时 `cleanup_empty()` 自动清理空 session；**frontend 和 CLI 均默认续接上次会话**（`last_session_id()`），`--new` 强制新建，`--continue <sid|last>` 指定续接。CLI 通过 `history list/show/clear/export/retitle` 子命令管理会话（`retitle` 批量重生成标题：`--dry-run` 预览、`--local` 只用本地规则、可选 session ID 前缀只处理一个）。
@@ -444,7 +472,7 @@ sessions/
 
 | 角色 | 类 | 职责 |
 |------|---|------|
-| Model | `AgentModel` | 装配 LLM/State/Context；`build_agent(mode, trust, stream, max_steps, permission_handler, state, max_steps_total) -> AgentLoop`；`ensure_loop()` 检测事件循环变化 → `LLMClient.recreate_client()` 重建 httpx transport（跨多次 `asyncio.run()` 调用时防 `Event loop is closed`） |
+| Model | `AgentModel` | 装配 LLM/State/Context；`build_agent(mode, trust, stream, max_steps, permission_handler, state, max_steps_total, permission_level) -> AgentLoop`；`ensure_loop()` 检测事件循环变化 → `LLMClient.recreate_client()` 重建 httpx transport（跨多次 `asyncio.run()` 调用时防 `Event loop is closed`） |
 | View | `TerminalView` | 事件渲染 + 权限交互输入（无业务逻辑，不改 agent 状态） |
 | Controller | `vil-agent-cli.py` / `vil-agent-frontend.py` | 各自实现参数解析与驱动方式 |
 
@@ -458,7 +486,7 @@ sessions/
 - **Rich markup `\[tag]` 转义**：所有字面方括号（`[session]`/`[history]` 等）用 `\[xxx]` 转义，避免被 Rich 误解析为 markup 标签而消失
 - **`file_diff` 渲染**：`write_file`/`delete_file` 覆盖模式自动生成 unified diff，用 `Syntax("diff")` + `Panel` 渲染给用户（LLM 不见，省 token）
 - **`<new_task/>` 静默过滤**：渲染时 `content.replace("<new_task/>", "")`，不显示给用户（前端 repl_loop 检测原始 content 触发提示）
-- **权限交互**：`prompt_permission(req)` 弹 `Panel` + `允许执行? [y/N] >`，返回 `allow`/`deny`；EOFError/KeyboardInterrupt 一律 `deny`
+- **权限交互**：`prompt_permission(req)` 弹 `Panel` + `允许执行? [y/N] >`，返回 `allow`/`deny`；EOFError/KeyboardInterrupt 一律 `deny`。面板里展示 `risk` 与（`run_command` 的）`summary`（模型生成的命令意图，见 L2 权限层）
 
 `SESSIONS_DIR = Path(os.environ.get("VIL_SESSIONS_DIR") or (Path.home() / ".vil" / "sessions"))`，可设环境变量覆盖（测试/多实例隔离用）。
 

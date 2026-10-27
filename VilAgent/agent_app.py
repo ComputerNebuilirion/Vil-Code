@@ -101,19 +101,25 @@ class AgentModel:
                     max_steps: int, permission_handler, state: State,
                     session_id: str = "",
                     session_manager: SessionManager | None = None,
-                    max_steps_total: int | None = None):
+                    max_steps_total: int | None = None,
+                    permission_level: str | None = None):
         # state 由 controller 创建：每个 session 一个独立 jsonl 文件
         # context_budget：超此 token 数时摘要旧消息（None=不启用）
         budget = self.cfg.get("context_budget")
         # 单轮步数硬上限：到达 max_steps 后自动续跑至此值（<=max_steps 时不启用）
         if max_steps_total is None:
             max_steps_total = self.cfg.get("max_steps_total")
+        # 权限层级：调用方显式传入优先，否则用配置（strict / balanced / auto）
+        if permission_level is None:
+            permission_level = self.cfg.get("permission_level")
         return AgentLoop(
             llm=self.llm, state=state, context=self.ctx,
             mode=mode, trust=trust, stream=stream,
             max_steps=max_steps,
             max_steps_total=max_steps_total,
             permission_handler=permission_handler,
+            permission_level=permission_level,
+            permission_summary=self.cfg.get("permission_summary", True),
             context_budget=budget,
             session_id=session_id,
             session_manager=session_manager,
@@ -414,11 +420,16 @@ class TerminalView:
         tool = req["tool"]
         args = req["args"]
         risk = req.get("risk")
+        summary = req.get("summary")
         body = Text()
         body.append(t("请求执行 ", "Request to run "), style="dim")
         body.append(tool, style="bold")
         if risk:
             body.append(t(f"\n风险评级: {risk}", f"\nrisk level: {risk}"), style="yellow")
+        # 模型生成的「这条命令/这段代码想干什么」：只在需要确认的执行类工具上有
+        if summary:
+            body.append(t("\n意图: ", "\nintent: "), style="dim")
+            body.append(summary, style="cyan")
         for k, v in args.items():
             s = str(v)
             preview = s[:120] + ("…" if len(s) > 120 else "")
