@@ -106,17 +106,21 @@ def classify_command(cmd: str) -> dict:
     return {"risk": "low", "cmd_type": ctype, "reasons": []}
 
 
-# ---- auto 层级的「可自动放行」命令判定（正向白名单，fail-closed）----
+# ---- 「已证明只读且无法拼接」的命令判定（正向白名单，fail-closed）----
+#
+# 注意：它**不再参与放行决策**（yolo 直接放行，balanced/strict 按工具类别决策），
+# 保留为可复用的证明器，供将来恢复「只自动放行只读命令」的中间层级、
+# 或用于审计/交叉验证黑名单口径。
 #
 # 与 classify_command 的黑名单语义分开，理由同 ast_check.safe_python：
 #   classify_command().risk == "low"  → 「没发现危险」（展示/提示用）
-#   safe_command()                    → 「已证明只读且无法拼接」（放行凭据）
+#   safe_command()                    → 「已证明只读且无法拼接」（正向证明）
 #
 # 比 Python 侧更严，因为 **run_command 完全不过沙箱**（sandbox 仅用于 run_python）：
 # L2 权限是它唯一的边界，一次误放行等于以当前用户身份直连执行。
-# 因此这里只放「只读探查」：任何可能写仓库、装依赖、联网或执行任意代码的命令
-# （python/pytest/npm/pip/curl/sed -i/tee…）都不在名单内 → 退回 ask。
-# 将来新增危险命令不必改这里：不在白名单里就天然不放行。
+# 因此这里只收「只读探查」：任何可能写仓库、装依赖、联网或执行任意代码的命令
+# （python/pytest/npm/pip/curl/sed -i/tee…）都不在名单内。
+# 将来新增危险命令不必改这里：不在白名单里就天然不通过。
 SAFE_COMMANDS = frozenset({
     "ls", "dir", "pwd", "echo", "cat", "type", "head", "tail", "wc",
     "sort", "uniq", "grep", "findstr", "which", "where", "whoami",
@@ -239,10 +243,12 @@ def _command_type(cmd: str, dangerous_label: str | None) -> str:
 
 def safe_command(cmd: str) -> tuple[bool, str]:
     """
-    正向判定：这条命令是否「已证明只读、且无法拼接」，可在 auto 层级直接放行。
+    正向判定：这条命令是否「已证明只读、且无法拼接」。
+
+    目前没有调用方，保留为可复用的证明器，见上方注释。
 
     :param cmd: shell 命令字符串
-    :return: (是否可自动放行, 说明)
+    :return: (是否通过证明, 说明)
     """
     raw = str(cmd or "")
     if not raw.strip():

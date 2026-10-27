@@ -147,7 +147,7 @@ vil-agent do --new 隔离执行不相关任务          # 不续接上次会话
 vil-agent do --continue <session_id> 续接指定会话
 vil-agent ask --no-stream --max-steps 10 快速看一眼
 vil-agent do --permission strict 每步都要我确认
-vil-agent do --permission auto 低风险命令别来烦我
+vil-agent do --permission yolo 别再问我了，出了问题我自己兜
 ```
 
 **多轮 REPL（frontend）**——模式是 flag，默认 `ask`：
@@ -157,7 +157,7 @@ python vil-agent-frontend.py                      # 默认 ask 模式
 python vil-agent-frontend.py --mode do            # 允许写操作
 python vil-agent-frontend.py --mode review
 python vil-agent-frontend.py --new                # 强制新会话
-python vil-agent-frontend.py --permission auto    # 权限层级（也可 REPL 内 /perm 切换）
+python vil-agent-frontend.py --permission yolo    # 权限层级（也可 REPL 内 /perm 切换）
 ```
 
 REPL 内 `/help` 查看全部斜杠命令，`/exit` 退出，Ctrl+C 中止当前任务但保留会话。
@@ -314,7 +314,7 @@ def my_tool(foo: str, _ctx=None) -> str:
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: pure|read|write|delete|network|exec|unknown, reasons: [...]}`。
   高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L2 硬底线直接 deny，L3 沙箱再兜一层；中等（网络/执行/写/删除）=放行进沙箱并交给 L2 决策。
 
-  `cmd_type` 只用于展示/供人判断，**不参与放行决策**（放行判据是 L2 的 `safe_python` 白名单）：`pure`=所有调用都是已知纯函数（`print`/`len`… 或白名单纯计算模块）、`read`/`write`/`delete`/`network`/`exec` 按操作归类（`Path.read_text()` 这类拿不到接收者类型的链式调用按方法名归类）、`unknown`=有认不出的调用——它既不等于安全也不等于危险，只是没信息。
+  `cmd_type` 只用于展示/供人判断，**不参与放行决策**（L1 只区分「是否 `high`」，其余判断在 L2）：`pure`=所有调用都是已知纯函数（`print`/`len`… 或白名单纯计算模块）、`read`/`write`/`delete`/`network`/`exec` 按操作归类（`Path.read_text()` 这类拿不到接收者类型的链式调用按方法名归类）、`unknown`=有认不出的调用——它既不等于安全也不等于危险，只是没信息。
 
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
 
@@ -333,11 +333,15 @@ def my_tool(foo: str, _ctx=None) -> str:
 |---|---|---|
 | `strict` | **所有非只读操作**都要人工确认（`write_file`/`edit_file` 也不例外） | 初次使用、审查陌生仓库 |
 | `balanced`（默认） | 写/编辑类工具 **allow**（低摩擦）；命令/代码执行类（`run_command`/`run_python`）**ask**；破坏性工具（`delete_file`）**ask** | 日常开发 |
-| `auto` | 在 `balanced` 基础上，**已证明只读/纯计算**的 `run_command` / `run_python` **直接 allow**，证明不了的（含 L1 判 `low` 但结构上无法证明的）仍 **ask**（`delete_file` 仍 ask） | 熟悉环境后的自动化 |
+| `yolo` | **不做任何执行前检查**：除下面的 deny 硬底线与用户规则外，所有调用（含 `run_command`/`run_python`/`delete_file`）**直接 allow**，风险评级不参与决策 | 完全信任当前工作区与环境、追求无人值守 |
 
-  `run_command` / `run_python` 的 `risk=high` 在任一层级都是 **deny**（内置硬底线，两工具同一口径：命令侧 `match_dangerous_command`、代码侧 `classify`），层级只影响「默认姿态」中 `medium` 及以下的部分；非 trust 模式（`ask`/`review`）写/执行一律 **deny**。用户规则文件与内置硬底线的优先级不变。
+  `run_command` / `run_python` 的 `risk=high` 在 `strict` / `balanced` 下都是 **deny**（内置硬底线，两工具同一口径：命令侧 `match_dangerous_command`、代码侧 `classify`），这两个层级只影响「默认姿态」中和 `medium` 及以下相关的部分；非 trust 模式（`ask`/`review`）写/执行一律 **deny**。用户规则文件与内置硬底线的优先级不变。
 
-  **`auto` 的放行判据是白名单证明，不是 `risk=low`**（`ast_check.safe_python` / `cmd_check.safe_command`）：`risk` 由黑名单式分类器产出，`low` 只意味着「**没发现**危险」，而黑名单必然不完备（`getattr(os, 'sys'+'tem')` 一类可以同时穿过 L1 和 L2）——拿它当放行凭据，漏判一次就是零确认执行任意代码。因此两者拆成独立判据：白名单只收「不碰文件/网络/进程」的纯计算模块（`math`/`json`/`re`…）与只读命令（`ls`/`cat`/`grep`/`git status`…），并且拒绝 dunder 属性、`getattr`/`eval`/`open` 等逃逸原语与 shell 元字符。判定不了的一律退回 `ask`：黑名单不完备的代价落在「多问一次」而不是「静默执行」。因为 `run_command` **完全不经过沙箱**（L2 是它唯一边界），命令侧白名单比代码侧更严——`python`/`pytest`/`npm`/`pip`/`curl` 均不放行。将来向黑名单新增条目不会扩大自动放行面（两套判据解耦）。
+  **`yolo` 的真实边界要说清楚**：它只保留两道闸——**deny 硬底线**（`rm -rf`/`del`/`mkfs`/fork 炸弹等灾难命令，`classify` 判 `high` 的代码）与**用户自己写进规则文件的 ask/deny**。除此之外不再有任何执行前检查，且 `run_command` **完全不经过沙箱**（L2 是它唯一边界），所以 agent 是以**你的用户权限**在执行，可写家目录、`~/.ssh`、任意挂载盘，不止当前工作区。`yolo` 会强制 `trust=True`（否则 `trust=False` 的默认姿态是「写/执行全 deny」，与该层级意图正相反）。两点实操细节：① 规则文件里的 `ask` 在 `yolo` 下仍会弹确认框，这是显式配置优先于默认姿态；② `rm -rf xxx`（哪怕目标只是工作区内的 `build/`）会被硬底线整条拒掉——要删目录请用 `delete_file` 工具，它走文件 API 而非 shell。
+
+  历史名字 `auto` 仍可作为 `--permission` / `permission_level` 的取值，等价于 `yolo`（旧配置不会静默回退到 `balanced`）。
+
+  **`ast_check.safe_python` / `cmd_check.safe_command` 目前没有调用方**：它们原本是「auto 层级」的放行判据（正向白名单证明：`risk=low` 只意味着「**没发现**危险」，不足以支撑零确认执行），`yolo` 改成「不做执行前检查」后这条链路不再需要。两个函数保留下来作可复用的证明器（将来若要恢复「只自动放行纯计算/只读命令」的中间层级可直接接上）与黑名单的交叉验证对照，单测在 `tests/test_safe_autopass.py` 里照旧覆盖其 fail-closed 语义。
 
   **确认前的执行意图总结**：`run_command`（命令）或 `run_python`（代码）走到 ask 时，若 `permission_summary=true`（默认），会用**一次小模型调用**生成一两句话，说明「这一步想实现什么」（含当前任务与静态评级作上下文；`run_python` 还会带上沙箱工作目录和限额，因为同样的代码在 `workspace` 下会真实改动仓库、在 `sandbox` 下碰不到），塞进权限请求的 `summary` 字段并 emit `intent_summary` 事件，`TerminalView` 在确认框里以「意图: …」展示。只在**需要确认**时触发——放行/拒绝路径、`permission_summary=false`、或其他工具（如 `write_file`）都不会多花这次调用；总结失败/超时（15s）静默降级为空，不阻断确认流程，也不进对话历史。
 
@@ -465,7 +469,7 @@ sessions/
 | `/title all [--dry-run]` | 批量重生成所有会话标题（老标题一次性迁移），`--dry-run` 只预览不写盘 |
 | `/compress [all]` | 手动摘要压缩：调 LLM 把当前会话旧历史压成摘要缓存（保留最近 10 条原文），`all` 忽略缓存强制重生成；无需 `context_budget` 即可生效 |
 | `/export [sid] [-o f]` | `export_markdown()` 导出为 .md（默认当前会话，支持 `-o` 指定路径） |
-| `/perm [strict\|balanced\|auto]` | 查看/切换权限层级（仅本次运行生效；持久化用 `/config set permission_level auto`） |
+| `/perm [strict\|balanced\|yolo]` | 查看/切换权限层级（仅本次运行生效；持久化用 `/config set permission_level yolo`） |
 | `/config` | 修改 `~/.vil/config.json`（详见下文「配置」） |
 
 启动时 `cleanup_empty()` 自动清理空 session；**frontend 和 CLI 均默认续接上次会话**（`last_session_id()`），`--new` 强制新建，`--continue <sid|last>` 指定续接。CLI 通过 `history list/show/clear/export/retitle` 子命令管理会话（`retitle` 批量重生成标题：`--dry-run` 预览、`--local` 只用本地规则、可选 session ID 前缀只处理一个）。

@@ -19,7 +19,7 @@ from .tools import execute_tool, get_tool_schemas
 from .safety import (
     check_safety, classify, is_path_safe, sandbox_run,
     PermissionSystem, Rule, ALLOW, ASK, DENY,
-    LEVEL_STRICT, LEVEL_BALANCED, LEVEL_AUTO, DEFAULT_LEVEL, normalize_level,
+    LEVEL_STRICT, LEVEL_BALANCED, LEVEL_YOLO, DEFAULT_LEVEL, normalize_level,
 )
 
 __all__ = [
@@ -42,7 +42,7 @@ __all__ = [
     "DENY",
     "LEVEL_STRICT",
     "LEVEL_BALANCED",
-    "LEVEL_AUTO",
+    "LEVEL_YOLO",
     "DEFAULT_LEVEL",
     "normalize_level",
     "CONFIG_DIR",

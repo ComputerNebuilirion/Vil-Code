@@ -5,7 +5,7 @@ from .cmd_check import (match_dangerous_command, classify_command,
 from .sandbox import sandbox_run, clean_stale_sandboxes, child_utf8_env, decode_output
 from .permissions import (
     PermissionSystem, Rule, ALLOW, ASK, DENY,
-    LEVEL_STRICT, LEVEL_BALANCED, LEVEL_AUTO, DEFAULT_LEVEL,
+    LEVEL_STRICT, LEVEL_BALANCED, LEVEL_YOLO, DEFAULT_LEVEL,
     normalize_level, level_label,
 )
 from pathlib import Path
@@ -49,7 +49,7 @@ __all__ = [
     "DENY",
     "LEVEL_STRICT",
     "LEVEL_BALANCED",
-    "LEVEL_AUTO",
+    "LEVEL_YOLO",
     "DEFAULT_LEVEL",
     "normalize_level",
     "level_label",

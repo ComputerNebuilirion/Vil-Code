@@ -109,7 +109,7 @@ class AgentModel:
         # 单轮步数硬上限：到达 max_steps 后自动续跑至此值（<=max_steps 时不启用）
         if max_steps_total is None:
             max_steps_total = self.cfg.get("max_steps_total")
-        # 权限层级：调用方显式传入优先，否则用配置（strict / balanced / auto）
+        # 权限层级：调用方显式传入优先，否则用配置（strict / balanced / yolo）
         if permission_level is None:
             permission_level = self.cfg.get("permission_level")
         return AgentLoop(

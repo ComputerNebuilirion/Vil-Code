@@ -47,7 +47,7 @@ from VilAgent.config import (
 )
 from VilAgent.i18n import t, set_lang, get_lang
 from VilAgent.input_line import read_line
-from VilAgent.safety import normalize_level, level_label
+from VilAgent.safety import normalize_level, level_label, LEVEL_YOLO
 
 
 # —— 常驻事件循环 ——
@@ -130,9 +130,10 @@ REPL 命令:
   /delete <id>           永久删除会话（需确认，默认当前）
   /deleteall             永久删除所有会话（需确认）
   /mode \\[ask|do|review]  查看/切换默认 mode
-  /perm \\[strict|balanced|auto]
+  /perm \\[strict|balanced|yolo]
                          查看/切换权限层级（strict=所有非只读都要确认，
-                         balanced=只有命令/删除类需确认，auto=低风险命令直接放行）
+                         balanced=只有命令/删除类需确认，
+                         yolo=不做执行前检查，所有调用直接执行）
   /tokens                显示当前会话累计 token
   /title \\[force]         用 LLM 生成/重生成当前会话标题（/sessions 里显示）
   /title all [--dry-run]  批量重生成所有会话标题（老标题一次性迁移；dry-run 只预览）
@@ -164,10 +165,10 @@ Session commands:
   /delete <id>           permanently delete a session (confirm; current by default)
   /deleteall             permanently delete all sessions (confirmation required)
   /mode \\[ask|do|review]  view / switch the default mode
-  /perm \\[strict|balanced|auto]
+  /perm \\[strict|balanced|yolo]
                          view / switch the permission level (strict = confirm every
                          non-readonly action, balanced = only command/delete actions,
-                         auto = low-risk commands run directly)
+                         yolo = no pre-execution checks, every call runs directly)
   /tokens                show cumulative tokens of the current session
   /title \\[force]         generate/regenerate a title for the current session
                          (shown by /sessions)
@@ -207,14 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-stream", action="store_true",
                    help=t("关闭流式输出", "Disable streaming output"))
     p.add_argument("--permission", dest="permission", default=None,
-                   choices=["strict", "balanced", "auto"],
+                   choices=["strict", "balanced", "yolo", "auto"],
                    help=t(
                        "权限层级：strict=所有非只读操作都要确认；"
                        "balanced=只有命令/删除类操作需确认（默认）；"
-                       "auto=低风险命令直接放行，中/高风险才确认",
+                       "yolo=不做执行前检查，所有调用直接执行（auto 为旧别名）",
                        "permission level: strict=confirm every non-readonly action; "
                        "balanced=only command/delete actions need confirmation (default); "
-                       "auto=low-risk commands run directly, medium/high ask"))
+                       "yolo=no pre-execution checks, everything runs "
+                       "(auto is a legacy alias)"))
     return p
 
 
@@ -802,19 +804,27 @@ def repl_loop(model: AgentModel, view: TerminalView,
                 _console.print(t(f"当前权限层级: {perm_level} — {level_label(perm_level)}",
                                  f"current permission level: {perm_level} — {level_label(perm_level)}"))
                 _console.print(t(
-                    "[dim]用法: /perm strict|balanced|auto（仅本次运行生效；"
-                    "持久化请用 /config set permission_level auto）[/dim]",
-                    "[dim]usage: /perm strict|balanced|auto (this run only; "
-                    "persist with /config set permission_level auto)[/dim]"))
-            elif parts[1].lower() in ("strict", "balanced", "auto"):
+                    "[dim]用法: /perm strict|balanced|yolo（仅本次运行生效；"
+                    "持久化请用 /config set permission_level yolo）[/dim]",
+                    "[dim]usage: /perm strict|balanced|yolo (this run only; "
+                    "persist with /config set permission_level yolo)[/dim]"))
+            elif parts[1].lower() in ("strict", "balanced", "yolo", "auto"):
                 perm_level = normalize_level(parts[1])
                 _console.print(t(f"权限层级 → {perm_level} — {level_label(perm_level)}",
                                  f"permission level → {perm_level} — {level_label(perm_level)}"))
+                if perm_level == LEVEL_YOLO:
+                    # 这一层没有任何执行前检查，切换时把边界说清楚（不是阻塞确认）
+                    _console.print(t(
+                        "[yellow]⚠ yolo：不再询问任何操作，agent 以你的用户权限执行，"
+                        "可写工作区外的任意路径；仅灾难命令（rm -rf / 等）仍被硬拦截[/yellow]",
+                        "[yellow]⚠ yolo: no more prompts; the agent runs with your user "
+                        "privileges and can write anywhere, not just the workspace. "
+                        "Only catastrophic commands (rm -rf / etc.) are hard-blocked[/yellow]"))
             else:
                 _console.print(t(
-                    f"{_tag('error')} 未知权限层级: {parts[1]}（strict/balanced/auto）",
+                    f"{_tag('error')} 未知权限层级: {parts[1]}（strict/balanced/yolo）",
                     f"{_tag('error')} unknown permission level: {parts[1]} "
-                    f"(strict/balanced/auto)"))
+                    f"(strict/balanced/yolo)"))
             continue
         if line.startswith("/switch "):
             new_sid = line[len("/switch "):].strip()
@@ -1053,7 +1063,7 @@ def _render_banner(console, sm, sid: str, resumed: bool, args) -> None:
     mode_color = "bold green" if mode == "ask" else ("bold red" if mode == "do" else "bold yellow")
     perm = normalize_level(getattr(args, "permission", None) or cfg.get("permission_level"))
     perm_color = {"strict": "bold red", "balanced": "bold yellow",
-                  "auto": "bold green"}.get(perm, "bold yellow")
+                  "yolo": "bold green"}.get(perm, "bold yellow")
     max_steps = args.max_steps or cfg.get("max_steps") or 50
     llm = cfg.get("llm", {}) or {}
     model_name = llm.get("model") or "?"
@@ -1074,7 +1084,7 @@ def _render_banner(console, sm, sid: str, resumed: bool, args) -> None:
     right = Text(f"v{_ver}", style="dim")
     lines.append(_justify_row(logo, right, width=panel_width))
 
-    # 2. 模式 chip（ask=绿 do=红 review=黄）+ 权限层级 chip（strict=红 balanced=黄 auto=绿）
+    # 2. 模式 chip（ask=绿 do=红 review=黄）+ 权限层级 chip（strict=红 balanced=黄 yolo=绿）
     mode_line = Text()
     mode_line.append("  mode:  ", style="dim")
     mode_line.append(mode.upper().ljust(6), style=mode_color)

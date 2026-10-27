@@ -213,18 +213,21 @@ def check_safety(code: str) -> tuple[bool, str]:
                   f"passed pre-check (risk={c['risk']}, type={c['cmd_type']})")
 
 
-# ---- auto 层级的「可自动放行」判定（正向白名单，fail-closed）----
+# ---- 「结构上可证明纯粹」判定（正向白名单，fail-closed）----
+#
+# 注意：它**不再参与放行决策**。yolo 层级不做执行前检查，balanced/strict 靠的是
+# 「工具类别」而非代码结构，所以下面这套判据目前没有调用方。保留的理由：
+#   1. 它是一个独立的、可复用的「这段代码是否碰不到文件/网络/进程」证明器，
+#      将来若要恢复「只自动放行纯计算」的中间层级，直接接上即可；
+#   2. 它的白名单是黑名单的对照物，改 classify() 时能拿来交叉验证口径。
 #
 # 与 classify() 刻意分成两套语义，不要合并：
 #   classify().risk == "low"  → 「没发现危险」（黑名单发现式，完备性无法保证）
 #   safe_python()             → 「结构上够不到逃逸原语」（白名单证明式，判不准即不放行）
-# 前者可用于展示/提示/deny 加厚，**不能**拿来当自动放行的凭据：黑名单漏判一次，
-# auto 层级就会静默执行任意代码，代价没有上界。白名单则相反——漏判只退化成
-# 多问一次（ask），代价有上界。
 #
-# 白名单只收「不碰文件/网络/进程」的纯计算模块。因此 auto 层级的实际语义是
-# 「纯计算零确认」：任何 import 未列入白名单的模块（os/sys/pathlib/subprocess…）
-# 都会退回 ask。将来新增危险模块**不需要改这里** —— 不在白名单里就天然不放行。
+# 白名单只收「不碰文件/网络/进程」的纯计算模块。任何 import 未列入白名单的模块
+# （os/sys/pathlib/subprocess…）都会判 False。将来新增危险模块**不需要改这里**
+# —— 不在白名单里就天然不通过。
 SAFE_IMPORT_MODULES = frozenset({
     "math", "cmath", "random", "statistics", "decimal", "fractions",
     "json", "re", "itertools", "functools", "collections", "operator",
@@ -248,14 +251,16 @@ _FORBIDDEN_NAMES = frozenset({
 
 def safe_python(code: str) -> tuple[bool, str]:
     """
-    正向判定：这段代码是否「结构上够不到逃逸原语」，可在 auto 层级直接放行。
+    正向判定：这段代码是否「结构上够不到逃逸原语」。
 
     与 check_safety 的区别在于提问方向：check_safety 答「没发现危险」（黑名单），
-    本函数答「已证明无逃逸路径」（白名单）。判不准一律返回 False —— 见模块顶部
-    说明：auto 层级放行的代价必须落在"多问一次"，而不是"静默执行"。
+    本函数答「已证明无逃逸路径」（白名单）。判不准一律返回 False。
+
+    目前没有调用方（yolo 层级不做执行前检查，其余层级按工具类别决策），
+    保留为可复用的证明器 + 黑名单的交叉验证对照，见上方注释。
 
     :param code: Python 源码
-    :return: (是否可自动放行, 说明)
+    :return: (是否通过证明, 说明)
     """
     try:
         tree = ast.parse(code)

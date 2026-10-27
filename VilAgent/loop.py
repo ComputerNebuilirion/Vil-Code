@@ -323,7 +323,7 @@ class AgentLoop:
 
         # L2 权限系统：显式传入优先，否则自动解析 <workspace>/.vil/permissions.json
         # 或 ~/.vil/permissions.json（让规则文件真正生效）；空串也走默认解析
-        # level 决定默认姿态（strict / balanced / auto，见 safety/permissions.py）
+        # level 决定默认姿态（strict / balanced / yolo，见 safety/permissions.py）
         if not permissions_file:
             permissions_file = default_rules_file(context.workspace)
         self.permission_level = normalize_level(permission_level or DEFAULT_LEVEL)
