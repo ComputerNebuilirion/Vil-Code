@@ -312,16 +312,18 @@ def my_tool(foo: str, _ctx=None) -> str:
 ```
 
 - **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
-  高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L3 直接拒；中等（网络/执行/写）=放行进沙箱并交给 L2 决策。
+  高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L2 硬底线直接 deny，L3 沙箱再兜一层；中等（网络/执行/写）=放行进沙箱并交给 L2 决策。
 
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
 
   `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse`，以及 Linux 专属的 fork 炸弹 / `chmod -R 777 /` / `> /dev/sda` …）判 `high`，网络工具判 `medium`。
 - **L2 `PermissionSystem`** → 工具调用前决策 `allow/ask/deny`。
   
-  顺序：readonly 工具放行 → 内置 deny 硬底线（危险命令，**用户规则无法放行**）→ 用户规则命中 → 默认姿态。
+  顺序：readonly 工具放行 → 内置 deny 硬底线（危险命令 / AST 判 `high` 的代码，**用户规则无法放行**）→ 用户规则命中 → 默认姿态。
 
   硬底线用 `match_dangerous_command()` 对命令做**规范化（小写+折叠空白）+ 正则 search**，可覆盖大小写（`RM -RF /`）、前缀（`sudo rm -rf /`）、拼接（`echo x && rm -rf /`）以及 Windows/PowerShell（`del`/`rd /s`/`format`/`Remove-Item -Recurse`）、Linux 专属（fork 炸弹 `:(){ :|:& };:`、根目录放开权限 `chmod -R 777 /`、裸块设备写入 `> /dev/sda`/`tee /dev/nvme0n1`）等绕过写法（`exec.py` 复用同一匹配器，避免两套口径不一致）。黑名单混合三类平台条目（Unix / Windows cmd / PowerShell），在各自平台上互为死代码但无害，不按平台分层以保持单一口径。
+
+  `run_python` 侧按 `classify(code)["risk"] == "high"` 拦，与沙箱 `check_safety()` 完全同一判据 —— 因此**不新增任何拒绝面**，只是把「确认弹窗批准后又被沙箱拒绝」提前成「直接拒绝」，省掉一次无意义的交互。判据取自 `classify(code)` 本身而非调用方传入的 `risk`，传 `risk="low"` 绕不过去。
 
   **默认姿态（trust 模式 / do 模式）由用户可选的权限层级 `permission_level` 决定**（CLI/frontend `--permission` 指定，REPL 内 `/perm` 切换，或 `config set permission_level ...` 持久化）：
 
@@ -331,7 +333,7 @@ def my_tool(foo: str, _ctx=None) -> str:
 | `balanced`（默认） | 写/编辑类工具 **allow**（低摩擦）；命令/代码执行类（`run_command`/`run_python`）**ask**；破坏性工具（`delete_file`）**ask** | 日常开发 |
 | `auto` | 在 `balanced` 基础上，L1 静态检查 `risk=low` 的 `run_command` / `run_python` **直接 allow**，`risk=medium/high` 才 **ask**（`delete_file` 仍 ask） | 熟悉环境后的自动化 |
 
-  `risk=high` 在任一层级都是 **ask**（危险命令更早已被内置 deny 硬底线拦下），非 trust 模式（`ask`/`review`）写/执行一律 **deny**。层级只影响「默认姿态」，用户规则文件与内置硬底线的优先级不变。
+  `run_command` / `run_python` 的 `risk=high` 在任一层级都是 **deny**（内置硬底线，两工具同一口径：命令侧 `match_dangerous_command`、代码侧 `classify`），层级只影响「默认姿态」中 `medium` 及以下的部分；非 trust 模式（`ask`/`review`）写/执行一律 **deny**。用户规则文件与内置硬底线的优先级不变。
 
   **确认前的执行意图总结**：`run_command`（命令）或 `run_python`（代码）走到 ask 时，若 `permission_summary=true`（默认），会用**一次小模型调用**生成一两句话，说明「这一步想实现什么」（含当前任务与静态评级作上下文；`run_python` 还会带上沙箱工作目录和限额，因为同样的代码在 `workspace` 下会真实改动仓库、在 `sandbox` 下碰不到），塞进权限请求的 `summary` 字段并 emit `intent_summary` 事件，`TerminalView` 在确认框里以「意图: …」展示。只在**需要确认**时触发——放行/拒绝路径、`permission_summary=false`、或其他工具（如 `write_file`）都不会多花这次调用；总结失败/超时（15s）静默降级为空，不阻断确认流程，也不进对话历史。
 

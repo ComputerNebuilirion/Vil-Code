@@ -7,7 +7,8 @@ per-action 权限评估就是安全边界。trust 控制默认姿态，规则文
 公共前置（trust=True，即 do 模式）：
   - 只读工具            → allow
   - 内置高危 deny 规则  → deny（硬底线，用户规则无法放行）
-  - 高危（risk=high）   → ask
+                          命令类=危险命令模式，代码类=AST 判 high（与 sandbox L1 同判据）
+  - 其余高危（risk=high）→ ask
 层级（`level`，见 normalize_level）：
   - strict   → 所有非只读操作一律 ask（写/编辑也不例外，最保守）
   - balanced → 写/编辑类 allow；命令/代码执行类 ask；破坏性工具 ask（默认值）
@@ -20,7 +21,9 @@ per-action 权限评估就是安全边界。trust 控制默认姿态，规则文
   格式：{"rules":[{"tool":"run_command","pattern":"git *","action":"allow"}]}
   注意：内置 deny 是硬底线，规则文件里的 allow 无法放行危险命令
   （rm -rf、del、rd /s、format、mkfs、Remove-Item -Recurse 等，规范化正则匹配，
-   可覆盖大小写/前缀(sudo)/拼接(a && rm ...)等绕过写法）。
+   可覆盖大小写/前缀(sudo)/拼接(a && rm ...)等绕过写法），也无法放行
+  AST 判为 high 的 run_python 代码（ctypes/win32api 导入、exec/eval/compile/
+  __import__ 调用等，与沙箱 L1 预检同一判据）。
 """
 import fnmatch
 import json
@@ -98,9 +101,21 @@ class Rule:
     action: str = ASK            # allow / ask / deny
 
 
-# 内置硬底线：命令类工具命中危险命令模式 → 始终 deny，用户规则无法放行
-# （与 exec.py 黑名单统一为同一匹配器，规范化正则可覆盖大小写/前缀/拼接绕过）
+# 内置硬底线 → 始终 deny，用户规则无法放行
+#   命令类：命中危险命令模式（与 exec.py 黑名单同一匹配器，规范化正则可覆盖
+#           大小写/前缀(sudo)/拼接(a && rm ...)等绕过写法）
+#   代码类：AST 判 risk=high（与 sandbox.py 的 L1 预检 check_safety 完全同一判据）
+# 代码侧刻意复用同一判据，而非另设一套：这样不新增任何拒绝面，只是把
+# 「先问用户、批准后再被沙箱拒绝」提前成「直接拒绝」，省掉一次无意义的确认弹窗。
 def _builtin_deny(tool_name: str, args: dict) -> str | None:
+    if tool_name == "run_python":
+        code = args.get("code")
+        if isinstance(code, str):
+            cls = classify(code)
+            if cls.get("risk") == "high":
+                return "; ".join(cls.get("reasons") or []) or t(
+                    "高风险代码", "high-risk code")
+        return None
     cmd = args.get("command")
     if isinstance(cmd, str):
         return match_dangerous_command(cmd)
