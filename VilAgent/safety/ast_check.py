@@ -143,6 +143,98 @@ def check_safety(code: str) -> tuple[bool, str]:
                   f"passed pre-check (risk={c['risk']}, type={c['cmd_type']})")
 
 
+# ---- auto 层级的「可自动放行」判定（正向白名单，fail-closed）----
+#
+# 与 classify() 刻意分成两套语义，不要合并：
+#   classify().risk == "low"  → 「没发现危险」（黑名单发现式，完备性无法保证）
+#   safe_python()             → 「结构上够不到逃逸原语」（白名单证明式，判不准即不放行）
+# 前者可用于展示/提示/deny 加厚，**不能**拿来当自动放行的凭据：黑名单漏判一次，
+# auto 层级就会静默执行任意代码，代价没有上界。白名单则相反——漏判只退化成
+# 多问一次（ask），代价有上界。
+#
+# 白名单只收「不碰文件/网络/进程」的纯计算模块。因此 auto 层级的实际语义是
+# 「纯计算零确认」：任何 import 未列入白名单的模块（os/sys/pathlib/subprocess…）
+# 都会退回 ask。将来新增危险模块**不需要改这里** —— 不在白名单里就天然不放行。
+SAFE_IMPORT_MODULES = frozenset({
+    "math", "cmath", "random", "statistics", "decimal", "fractions",
+    "json", "re", "itertools", "functools", "collections", "operator",
+    "datetime", "time", "string", "textwrap", "unicodedata",
+    "hashlib", "base64", "binascii", "zlib", "struct", "copy", "enum",
+    "typing", "dataclasses", "pprint", "uuid", "html",
+})
+
+# 动态派发/执行原语：一经出现即拒绝（哪怕叫法合法，能借此触达的属性不可穷举）
+_FORBIDDEN_CALLS = frozenset({
+    "getattr", "setattr", "delattr", "vars", "globals", "locals", "dir",
+    "eval", "exec", "compile", "__import__", "open", "breakpoint", "input",
+})
+
+# 直接引用这些名字等于把逃逸出口放进作用域
+_FORBIDDEN_NAMES = frozenset({
+    "__builtins__", "__import__", "__loader__", "__spec__",
+    "__package__", "__file__", "__cached__", "__debug__",
+})
+
+
+def safe_python(code: str) -> tuple[bool, str]:
+    """
+    正向判定：这段代码是否「结构上够不到逃逸原语」，可在 auto 层级直接放行。
+
+    与 check_safety 的区别在于提问方向：check_safety 答「没发现危险」（黑名单），
+    本函数答「已证明无逃逸路径」（白名单）。判不准一律返回 False —— 见模块顶部
+    说明：auto 层级放行的代价必须落在"多问一次"，而不是"静默执行"。
+
+    :param code: Python 源码
+    :return: (是否可自动放行, 说明)
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, t(f"语法错误: {e}", f"syntax error: {e}")
+
+    for node in ast.walk(tree):
+        # 1. import：白名单制（不是"危险模块黑名单"，方向相反）
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root not in SAFE_IMPORT_MODULES:
+                    return False, t(
+                        f"导入未列入白名单的模块: {alias.name}",
+                        f"imports non-allowlisted module: {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if not mod or mod.split(".")[0] not in SAFE_IMPORT_MODULES:
+                return False, t(
+                    f"从非白名单模块导入: {mod or '(相对导入)'}",
+                    f"imports from non-allowlisted module: {mod or '(relative import)'}")
+
+        # 2. 逃逸出口的名字
+        elif isinstance(node, ast.Name):
+            if node.id in _FORBIDDEN_NAMES:
+                return False, t(f"访问内置原语: {node.id}",
+                               f"accesses builtin primitive: {node.id}")
+
+        # 3. dunder 属性访问：().__class__ / f.__globals__ / t.__subclasses__ 一类
+        #    的沙箱逃逸全部依赖它，一律拒绝（含 __init__，代价只是多问一次）
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                return False, t(f"访问 dunder 属性: .{node.attr}",
+                               f"accesses dunder attribute: .{node.attr}")
+
+        # 4. 调用：必须是静态可解析的名字链，且不是执行/动态派发原语
+        elif isinstance(node, ast.Call):
+            name = _get_full_name(node.func)
+            if name is None:
+                # obj[0]()、f()() 这类无法静态解析的调用 → 证明不了，不放行
+                return False, t("存在无法静态解析的调用目标",
+                               "call target cannot be resolved statically")
+            if name in _FORBIDDEN_CALLS or name.split(".")[-1] in _FORBIDDEN_CALLS:
+                return False, t(f"调用执行/动态派发原语: {name}",
+                               f"calls exec/dynamic-dispatch primitive: {name}")
+
+    return True, t("纯计算，无逃逸原语", "pure computation, no escape primitive")
+
+
 def _match_module(name: str, modules) -> bool:
     """匹配 import 名：urllib.request 匹配 urllib；os 匹配 os"""
     return any(name == m or name.startswith(m + ".") for m in modules)

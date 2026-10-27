@@ -12,8 +12,8 @@ per-action 权限评估就是安全边界。trust 控制默认姿态，规则文
 层级（`level`，见 normalize_level）：
   - strict   → 所有非只读操作一律 ask（写/编辑也不例外，最保守）
   - balanced → 写/编辑类 allow；命令/代码执行类 ask；破坏性工具 ask（默认值）
-  - auto     → 在 balanced 基础上，静态检查 risk=low 的 run_command / run_python
-               直接 allow，risk=medium/high 仍需 ask
+  - auto     → 在 balanced 基础上，「已证明只读/纯计算」的 run_command / run_python
+               直接 allow；判不准的（含静态检查判 low 但结构上无法证明）仍需 ask
 非 trust 模式：写/执行一律 deny（只读放行）。
 
 规则文件（用户可覆盖默认，用于进一步放松或收紧）：
@@ -31,8 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..i18n import t
-from .ast_check import classify
-from .cmd_check import classify_command, match_dangerous_command
+from .ast_check import classify, safe_python
+from .cmd_check import match_dangerous_command, safe_command
 
 ALLOW = "allow"
 ASK = "ask"
@@ -41,7 +41,8 @@ DENY = "deny"
 # —— 用户可选的权限层级（config: permission_level / CLI --permission / REPL /perm）——
 # strict   所有非只读操作都要人工确认（写/编辑也不例外）
 # balanced 只有命令/代码执行 + 破坏性操作要确认，写/编辑直接放行（默认）
-# auto     balanced + 静态检查 risk=low 的命令/代码直接放行（medium/high 仍确认）
+# auto     balanced + 通过白名单证明（safe_command / safe_python）的执行类调用
+#          直接放行；证明不了的一律确认（不用 risk=low 当放行凭据）
 LEVEL_STRICT = "strict"
 LEVEL_BALANCED = "balanced"
 LEVEL_AUTO = "auto"
@@ -69,8 +70,9 @@ def level_label(level) -> str:
         return t("strict：所有非只读操作都要确认",
                  "strict: confirm every non-readonly action")
     if level == LEVEL_AUTO:
-        return t("auto：低风险命令/代码直接放行，中/高风险确认",
-                 "auto: low-risk commands and code run directly, medium/high ask")
+        return t("auto：已证明只读/纯计算的命令直接放行，其余确认",
+                 "auto: provably read-only/pure-compute commands run directly, "
+                 "everything else asks")
     return t("balanced：只有命令/删除类操作需要确认",
              "balanced: only command / delete actions need confirmation")
 
@@ -78,17 +80,23 @@ def level_label(level) -> str:
 # 即使 trust=True 也仍需人工确认的「执行类」工具（其余非只读工具默认放行）
 _EXEC_TOOLS = {"run_command", "run_python"}
 
-# auto 层级可以直接放行的执行类工具（静态检查 risk=low 时）
-_AUTO_RISK_TOOLS = {"run_command", "run_python"}
+# auto 层级可考虑直接放行的执行类工具（是否真放行由下面的白名单判据决定）
+_AUTO_PASS_TOOLS = {"run_command", "run_python"}
 
 
-def _classify_risk(tool_name: str, args: dict) -> str | None:
-    """给 auto 层级补一次静态风险分类（命令层 / AST 层各用各的分类器）"""
+def _auto_pass(tool_name: str, args: dict) -> tuple[bool, str]:
+    """auto 层级放行判定：**正向白名单证明**，判不准即不放行（fail-closed）。
+
+    刻意不使用 risk 字段。risk 是黑名单发现式的产物（low = 没发现危险），
+    与「已证明可安全执行」不是同一个命题；拿它当放行凭据，黑名单漏判一次
+    就会静默执行（代价无上界）。两套判据分开后，将来改黑名单也不会连带
+    改变自动放行面。未登记的工具一律不放行：新增工具必须显式给出证明判据。
+    """
     if tool_name == "run_command":
-        return classify_command(str(args.get("command") or "")).get("risk")
+        return safe_command(str(args.get("command") or ""))
     if tool_name == "run_python":
-        return classify(str(args.get("code") or "")).get("risk")
-    return None
+        return safe_python(str(args.get("code") or ""))
+    return False, t("该工具无白名单判据", "no allowlist criterion for this tool")
 
 # 即使 trust=True 也仍需人工确认的「破坏性」工具：删除不可逆，单独收紧为 ask
 _DESTRUCTIVE_TOOLS = {"delete_file"}
@@ -149,7 +157,7 @@ class PermissionSystem:
          - risk=high              → trust ? ask : deny
          - 非 trust（写/执行）     → deny
          - level=strict           → ask（所有非只读）
-         - level=auto + run_command + risk=low → allow
+         - level=auto + 白名单证明通过（safe_command / safe_python）→ allow
          - 执行/破坏类（run_command / run_python / delete_file）→ ask
          - 写/编辑类              → allow
     """
@@ -200,6 +208,12 @@ class PermissionSystem:
 
     def evaluate(self, tool_name: str, args: dict,
                  readonly: bool, risk: str | None = None) -> str:
+        """返回 allow / ask / deny。
+
+        ``risk`` 只用于「加厚拒绝」（high → 至少 ask）与上层展示，
+        **绝不作为放行凭据**：它的语义是「没发现危险」而非「已证明安全」，
+        放行判定统一走 _auto_pass 的白名单证明。
+        """
         # 1. 只读工具放行
         if readonly:
             return ALLOW
@@ -221,15 +235,12 @@ class PermissionSystem:
         # 层级 1（strict）：所有非只读操作都要人工确认，写/编辑也不例外
         if self.level == LEVEL_STRICT:
             return ASK
-        # 层级 3（auto）：静态检查 low 的执行类调用直接放行（medium/high 仍 ask）
-        # run_python 与 run_command 同等待遇：沙箱本身已有限额隔离，
-        # 让「安全的临时计算」零摩擦，模型才愿意走沙箱，
-        # 而不是 write_file 造脚本再 run_command 绕过去。
-        if self.level == LEVEL_AUTO and tool_name in _AUTO_RISK_TOOLS:
-            if risk is None:
-                # 调用方没先分类时自行补一次（只读分类，无副作用）
-                risk = _classify_risk(tool_name, args)
-            if risk == "low":
+        # 层级 3（auto）：只有「已证明可安全执行」的执行类调用才直接放行。
+        # 判据是白名单证明（safe_command / safe_python），**不是** risk=low：
+        # risk 只回答「没发现危险」，不足以支撑零确认执行；判不准一律 ask，
+        # 让黑名单的不完备性退化成「多问一次」而非「静默执行」。
+        if self.level == LEVEL_AUTO and tool_name in _AUTO_PASS_TOOLS:
+            if _auto_pass(tool_name, args)[0]:
                 return ALLOW
         if tool_name in _EXEC_TOOLS or tool_name in _DESTRUCTIVE_TOOLS:
             return ASK

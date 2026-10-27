@@ -18,7 +18,8 @@ import re
 
 from ..i18n import t
 
-__all__ = ["normalize_command", "match_dangerous_command", "classify_command"]
+__all__ = ["normalize_command", "match_dangerous_command", "classify_command",
+           "safe_command"]
 
 
 def normalize_command(cmd: str) -> str:
@@ -95,3 +96,97 @@ def classify_command(cmd: str) -> dict:
             "reasons": [t("命令含网络工具", "command uses a network tool")],
         }
     return {"risk": "low", "cmd_type": "unknown", "reasons": []}
+
+
+# ---- auto 层级的「可自动放行」命令判定（正向白名单，fail-closed）----
+#
+# 与 classify_command 的黑名单语义分开，理由同 ast_check.safe_python：
+#   classify_command().risk == "low"  → 「没发现危险」（展示/提示用）
+#   safe_command()                    → 「已证明只读且无法拼接」（放行凭据）
+#
+# 比 Python 侧更严，因为 **run_command 完全不过沙箱**（sandbox 仅用于 run_python）：
+# L2 权限是它唯一的边界，一次误放行等于以当前用户身份直连执行。
+# 因此这里只放「只读探查」：任何可能写仓库、装依赖、联网或执行任意代码的命令
+# （python/pytest/npm/pip/curl/sed -i/tee…）都不在名单内 → 退回 ask。
+# 将来新增危险命令不必改这里：不在白名单里就天然不放行。
+SAFE_COMMANDS = frozenset({
+    "ls", "dir", "pwd", "echo", "cat", "type", "head", "tail", "wc",
+    "sort", "uniq", "grep", "findstr", "which", "where", "whoami",
+    "date", "uname", "more", "tree",
+})
+
+# git 只放只读子命令
+SAFE_GIT_SUBCOMMANDS = frozenset({
+    "status", "log", "diff", "show", "rev-parse", "describe",
+    "ls-files", "blame", "shortlog",
+})
+
+# branch/remote 携带写语义（-D 删分支、remote add 改配置）→ 只认这几个参数
+_GIT_SUB_ALLOWED_ARGS = {
+    "branch": frozenset({"-l", "--list", "-a", "-r", "-v", "-vv",
+                         "--show-current", "--all", "--remotes"}),
+    "remote": frozenset({"-v", "--verbose", "show"}),
+}
+
+# git 里能执行任意程序的参数（-c alias.x=!cmd、--exec-path、--output 写文件）
+_GIT_UNSAFE_ARGS = frozenset({"-c", "--exec-path", "--upload-pack",
+                              "--output", "--ext-diff"})
+
+# shell 元字符：出现即可能拼接命令或重定向写文件 → 不放行
+_SHELL_META = (";", "&", "|", ">", "<", "$", "`", "(", ")", "\n", "\r")
+
+
+def safe_command(cmd: str) -> tuple[bool, str]:
+    """
+    正向判定：这条命令是否「已证明只读、且无法拼接」，可在 auto 层级直接放行。
+
+    :param cmd: shell 命令字符串
+    :return: (是否可自动放行, 说明)
+    """
+    raw = str(cmd or "")
+    if not raw.strip():
+        return False, t("空命令", "empty command")
+    if any(m in raw for m in _SHELL_META):
+        return False, t("命令含 shell 元字符（可拼接命令或重定向写文件）",
+                        "command contains shell metacharacters "
+                        "(can chain commands or redirect to files)")
+
+    parts = raw.split()
+    exe = parts[0].lower()
+    if exe == "git":
+        return _safe_git(parts[1:])
+    if exe not in SAFE_COMMANDS:
+        return False, t(f"命令未列入白名单: {exe}",
+                        f"command not allowlisted: {exe}")
+    return True, t("只读探查命令", "read-only inspection command")
+
+
+def _safe_git(args: list[str]) -> tuple[bool, str]:
+    """git 参数校验：只读子命令 + 无执行任意程序的参数"""
+    lowered = [a.lower() for a in args]
+    for a in lowered:
+        # 兼容 --output=x / --exec-path=/x 这类带等号写法
+        if a.split("=", 1)[0] in _GIT_UNSAFE_ARGS:
+            return False, t(f"git 参数可执行任意程序或写文件: {a}",
+                            f"git arg can exec arbitrary program or write a file: {a}")
+    if not args:
+        return False, t("git 缺少只读子命令", "git without a read-only subcommand")
+
+    sub = next((a for a in lowered if not a.startswith("-")), "")
+    if not sub:
+        return False, t("git 缺少只读子命令", "git without a read-only subcommand")
+
+    # branch / remote 的写语义藏在位置参数里（git branch -D x / git remote add）
+    if sub in _GIT_SUB_ALLOWED_ARGS:
+        allowed = _GIT_SUB_ALLOWED_ARGS[sub]
+        rest = [a for a in lowered if a != sub]
+        for a in rest:
+            if a not in allowed:
+                return False, t(f"git {sub} 参数含写语义: {a}",
+                                f"git {sub} arg has write semantics: {a}")
+        return True, t("git 只读查询", "read-only git query")
+
+    if sub not in SAFE_GIT_SUBCOMMANDS:
+        return False, t(f"git 子命令非只读: {sub}",
+                        f"git subcommand not read-only: {sub}")
+    return True, t("git 只读查询", "read-only git query")
