@@ -537,6 +537,14 @@ class AgentLoop:
                             action = await self.permission_handler(req)
                         else:
                             action = DENY
+                        # 用户在确认框选了「总是允许」（handler 在 req 上打标记）：
+                        # 放行本次，同时把这次调用记成一条 allow 规则落盘
+                        if action == ALLOW and req.get("remember"):
+                            info = self.permissions.remember(name, args)
+                            await self._emit(callback, {
+                                "event": "permission_remembered",
+                                "name": name, **info,
+                            })
                     await self._emit(callback, {
                         "event": "permission_decision",
                         "name": name, "action": action,

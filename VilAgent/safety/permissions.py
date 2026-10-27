@@ -24,6 +24,12 @@ per-action 权限评估就是安全边界。trust 控制默认姿态，规则文
    可覆盖大小写/前缀(sudo)/拼接(a && rm ...)等绕过写法），也无法放行
   AST 判为 high 的 run_python 代码（ctypes/win32api 导入、exec/eval/compile/
   __import__ 调用等，与沙箱 L1 预检同一判据）。
+
+记住批准（remember，交互式确认时用户选「总是允许」）：
+  把**本次调用的字面量**写成一条 allow 规则（command / path，fnmatch 转义后
+  精确匹配，不做前缀放宽）并原子写入上面的规则文件；仅支持主字段短而稳定的
+  工具（run_command / delete_file / write_file / edit_file），run_python 的
+  代码块每次不同故不支持。它仍然只是「用户规则」，受内置 deny 硬底线约束。
 """
 import fnmatch
 import json
@@ -101,6 +107,42 @@ def _auto_pass(tool_name: str, args: dict) -> tuple[bool, str]:
 # 即使 trust=True 也仍需人工确认的「破坏性」工具：删除不可逆，单独收紧为 ask
 _DESTRUCTIVE_TOOLS = {"delete_file"}
 
+# —— 记住批准（remember）：ask 时用户选「总是允许」→ 落盘成一条 allow 规则 ——
+# 只支持「主字段短且稳定」的工具（命令串 / 路径）：下次**完全相同**的调用免确认。
+# run_python 的代码块每次几乎都不同，按整段代码精确匹配既命中不了又会让规则
+# 文件膨胀，故不支持（纯计算代码本就由 auto 层级的 safe_python 白名单覆盖）。
+_REMEMBERABLE_FIELDS = {
+    "run_command": "command",
+    "delete_file": "path",
+    "write_file": "path",
+    "edit_file": "path",
+}
+# 记住的模式长度上限：超过它说明不是「稳定的短命令」，不值得写进规则文件
+REMEMBER_MAX_PATTERN = 200
+
+
+def _escape_fnmatch(text: str) -> str:
+    """把字面串转成「只匹配它自己」的 fnmatch 模式（转义 * ? [ ]）"""
+    return "".join(f"[{c}]" if c in "*?[]" else c for c in text)
+
+
+def remember_pattern(tool_name: str, args: dict) -> str | None:
+    """该工具本次调用能否「记住」；能则返回要写入规则的 fnmatch 模式
+
+    模式是**转义后的字面量**，语义严格限定为「下次完全相同的调用免确认」，
+    不做前缀/通配放宽 —— 放宽等于批准一个命令就批准一族命令，与用户
+    「记住这一次」的意图不符，也会把白名单式的精确批准变成黑名单式的批量授权。
+    """
+    field = _REMEMBERABLE_FIELDS.get(tool_name)
+    if not field:
+        return None
+    raw = args.get(field)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    if len(raw) > REMEMBER_MAX_PATTERN:
+        return None
+    return _escape_fnmatch(raw)
+
 
 @dataclass
 class Rule:
@@ -152,7 +194,7 @@ class PermissionSystem:
     决策顺序：
       1. readonly 工具 → allow
       2. 内置 deny 硬底线命中 → deny（用户规则无法放行）
-      3. 用户规则命中（默认规则文件或显式传入）→ 该规则的 action
+      3. 用户规则命中（默认规则文件、「记住批准」写入的规则或显式传入）→ 该规则的 action
       4. 默认姿态（由 trust + level 共同决定）：
          - risk=high              → trust ? ask : deny
          - 非 trust（写/执行）     → deny
@@ -205,6 +247,99 @@ class PermissionSystem:
             if not any(fnmatch.fnmatch(tgt, rule.pattern) for tgt in targets):
                 return False
         return True
+
+    def rules_path(self) -> Path:
+        """「记住批准」的落盘位置：已有规则文件优先，否则 ~/.vil/permissions.json
+
+        优先复用当前生效的文件（项目里已有 `.vil/permissions.json` 就记进项目，
+        规则随仓库走；只有全局文件则记进全局），都没有时才新建全局文件——
+        不会主动往用户仓库里塞 `.vil/`。
+        """
+        if self.rules_file:
+            return Path(self.rules_file)
+        return Path.home() / ".vil" / "permissions.json"
+
+    def remember(self, tool_name: str, args: dict) -> dict:
+        """把本次调用记成一条 allow 规则并落盘（用户在确认框选「总是允许」时调用）
+
+        两条边界：
+          * 只记**本次调用的字面量**（见 remember_pattern），不放宽带通配；
+          * 内置硬底线仍然优先（evaluate 里 deny 在用户规则之前），所以「记住」
+            不可能把危险命令/高危代码变成放行。
+        读不出旧文件时**拒绝写入**，免得把用户手写的规则覆盖掉。
+
+        :return: {"saved": bool, "pattern": str|None, "path": str, "error": str|None}
+        """
+        pattern = remember_pattern(tool_name, args)
+        path = self.rules_path()
+        info = {"saved": False, "pattern": pattern, "path": str(path),
+                "error": None}
+
+        if not pattern:
+            info["error"] = t(
+                f"{tool_name} 无法记住批准（缺少可稳定匹配的参数）",
+                f"{tool_name} cannot be remembered (no stable argument to match on)",
+            )
+            return info
+
+        data: dict = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                info["error"] = t(
+                    f"规则文件无法解析，未写入: {path} ({e})",
+                    f"rules file is unreadable, nothing written: {path} ({e})",
+                )
+                return info
+            if not isinstance(loaded, dict):
+                info["error"] = t(
+                    f"规则文件不是 JSON 对象，未写入: {path}",
+                    f"rules file is not a JSON object, nothing written: {path}",
+                )
+                return info
+            data = loaded
+
+        rules = data.get("rules")
+        if not isinstance(rules, list):
+            rules = []
+        # 同工具同模式已有规则 → 就地改 action（重复记住幂等，不堆叠条目）
+        for r in rules:
+            if (isinstance(r, dict) and r.get("tool") == tool_name
+                    and r.get("pattern") == pattern):
+                r["action"] = ALLOW
+                break
+        else:
+            rules.append({"tool": tool_name, "pattern": pattern,
+                          "action": ALLOW})
+        data["rules"] = rules
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(path)  # 原子替换：不会留下半截规则文件
+        except OSError as e:
+            info["error"] = t(f"写入规则文件失败: {path} ({e})",
+                              f"failed to write rules file: {path} ({e})")
+            return info
+
+        # 内存里插到最前面：规则按顺序首次命中即返回，新记住的精确规则要
+        # 压过此前更宽的 ask/deny 规则，否则「记住」看起来没生效
+        for r in self.user_rules:
+            if r.tool == tool_name and r.pattern == pattern:
+                r.action = ALLOW
+                self.user_rules.remove(r)
+                self.user_rules.insert(0, r)
+                break
+        else:
+            self.user_rules.insert(0, Rule(tool=tool_name, pattern=pattern,
+                                           action=ALLOW))
+        info["saved"] = True
+        return info
 
     def evaluate(self, tool_name: str, args: dict,
                  readonly: bool, risk: str | None = None) -> str:
