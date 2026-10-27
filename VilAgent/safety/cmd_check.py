@@ -78,9 +78,12 @@ def match_dangerous_command(cmd: str) -> str | None:
 def classify_command(cmd: str) -> dict:
     """粗粒度风险分级，返回 {"risk", "cmd_type", "reasons"}（与 ast_check.classify 对齐）
 
-    risk: low | medium | high；cmd_type: exec | network | unknown
+    risk: low | medium | high
+    cmd_type: read | write | delete | network | exec | unknown（判定见下方
+    `_command_type`，依赖白名单表；只用于展示，不参与放行判定）
     """
     label = match_dangerous_command(cmd)
+    ctype = _command_type(cmd, label)
     if label:
         return {
             "risk": "high",
@@ -88,14 +91,19 @@ def classify_command(cmd: str) -> dict:
             "reasons": [t(f"匹配危险命令模式: {label}",
                           f"matches dangerous command pattern: {label}")],
         }
-    low = normalize_command(cmd)
-    if any(k in low for k in _NETWORK_KEYWORDS):
+    if ctype == "network":
         return {
             "risk": "medium",
             "cmd_type": "network",
             "reasons": [t("命令含网络工具", "command uses a network tool")],
         }
-    return {"risk": "low", "cmd_type": "unknown", "reasons": []}
+    if ctype == "delete":
+        return {
+            "risk": "medium",
+            "cmd_type": "delete",
+            "reasons": [t("命令会删除文件", "command deletes files")],
+        }
+    return {"risk": "low", "cmd_type": ctype, "reasons": []}
 
 
 # ---- auto 层级的「可自动放行」命令判定（正向白名单，fail-closed）----
@@ -134,6 +142,99 @@ _GIT_UNSAFE_ARGS = frozenset({"-c", "--exec-path", "--upload-pack",
 
 # shell 元字符：出现即可能拼接命令或重定向写文件 → 不放行
 _SHELL_META = (";", "&", "|", ">", "<", "$", "`", "(", ")", "\n", "\r")
+
+# —— classify_command 用的首词分类表（仅供展示，不参与放行判定）——
+# 删除类：不可逆，单独成档
+_DELETE_COMMANDS = frozenset({
+    "rm", "rmdir", "rd", "unlink", "del", "erase", "shred",
+})
+# 写类：创建/改名/改权限/复制
+_WRITE_COMMANDS = frozenset({
+    "touch", "mkdir", "cp", "mv", "tee", "chmod", "chown", "ln", "dd",
+    "copy", "move", "ren", "rename", "xcopy", "truncate",
+})
+# 包装词：跳过它们看真正的命令首词（sudo rm x → rm）
+_PREFIX_WORDS = frozenset({
+    "sudo", "time", "nohup", "env", "nice", "command", "exec",
+})
+
+# —— git 子命令归类（classify_command 的 cmd_type 用）——
+# 放行判定与这些表无关，仍走 safe_command → _safe_git（fail-closed）；
+# 本表只保证「报出来的类型」不撒谎：`git push` 不是 read、`git clean -fdx`
+# 不是 read。此前把所有 git 一律记 read，等于让「不可逆」命令在展示层伪装成
+# 只读操作——一旦有人拿 cmd_type 当可逆性/放行依据就会直接误放行。
+_GIT_DELETE_SUBCOMMANDS = frozenset({      # 不可恢复：删工作区文件或对象
+    "clean", "prune", "gc", "rm", "filter-branch",
+})
+_GIT_NETWORK_SUBCOMMANDS = frozenset({     # 与远端交互
+    "clone", "fetch", "pull", "push", "ls-remote", "submodule",
+})
+_GIT_WRITE_SUBCOMMANDS = frozenset({       # 改本地仓库/工作区，git 本身可回退
+    "add", "commit", "checkout", "switch", "restore", "stash", "merge",
+    "rebase", "reset", "cherry-pick", "revert", "tag", "mv", "apply", "am",
+    "config", "init", "branch", "notes", "worktree", "lfs", "remote",
+})
+# 把「可回退的写」变成「不可恢复的删」的参数（reset --hard / checkout -f / branch -D）
+_GIT_FORCE_FLAGS = frozenset({
+    "-f", "--force", "-d", "-D", "--hard", "--delete", "--discard-changes",
+})
+
+# 命令拼接/管道：只看首段会把 `git status; git push` 误判成只读
+_CHAIN_RE = re.compile(r";|&&|\|\|")
+
+
+def _git_cmd_type(args: list[str]) -> str:
+    """git 子命令的操作类型；认不出就 unknown（不猜成 read）"""
+    if _safe_git(args)[0]:
+        return "read"
+    lowered = [a.lower() for a in args]
+    sub = next((a for a in lowered if not a.startswith("-")), "")
+    if not sub:
+        return "unknown"
+    if sub in _GIT_DELETE_SUBCOMMANDS:
+        return "delete"
+    # stash drop/clear 丢掉的是不可恢复的暂存，其余 stash 操作可回退
+    if sub == "stash" and any(a in ("drop", "clear") for a in lowered):
+        return "delete"
+    if sub in _GIT_NETWORK_SUBCOMMANDS:
+        return "network"
+    # remote add/set-url 只改本地 .git/config；remote update 才会访问远端
+    if sub == "remote" and any(a == "update" for a in lowered):
+        return "network"
+    if sub in _GIT_WRITE_SUBCOMMANDS:
+        if any(a.split("=", 1)[0] in _GIT_FORCE_FLAGS for a in lowered):
+            return "delete"
+        return "write"
+    return "unknown"
+
+
+def _command_type(cmd: str, dangerous_label: str | None) -> str:
+    """命令的操作类型：read | write | delete | network | exec | unknown
+
+    纯展示用途。`unknown` 表示「首词不在任何表里」，既不等于安全也不等于危险。
+    """
+    if dangerous_label:
+        return "exec"
+    norm = normalize_command(cmd)
+    if any(k in norm for k in _NETWORK_KEYWORDS):
+        return "network"
+    tokens = norm.replace(";", " ").replace("&&", " ").replace("||", " ").split()
+    idx = next((i for i, w in enumerate(tokens) if w not in _PREFIX_WORDS), -1)
+    exe = tokens[idx].strip("'\"") if idx >= 0 else ""  # 兼容 "rm" / 'rm' 带引号写法
+    if not exe:
+        return "unknown"
+    if exe == "git":
+        # 拼接命令（git status; git push）只看首段会误判成只读 → 保守归 unknown
+        if _CHAIN_RE.search(str(cmd)):
+            return "unknown"
+        return _git_cmd_type(tokens[idx + 1:])
+    if exe in _DELETE_COMMANDS:
+        return "delete"
+    if exe in _WRITE_COMMANDS or ">" in norm:
+        return "write"
+    if exe in SAFE_COMMANDS:
+        return "read"
+    return "unknown"
 
 
 def safe_command(cmd: str) -> tuple[bool, str]:

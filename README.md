@@ -311,12 +311,14 @@ def my_tool(foo: str, _ctx=None) -> str:
 └──────────────────────────────────────────┘
 ```
 
-- **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: read|write|network|exec|unknown, reasons: [...]}`。
-  高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L2 硬底线直接 deny，L3 沙箱再兜一层；中等（网络/执行/写）=放行进沙箱并交给 L2 决策。
+- **L1 `classify(code)`** → `{risk: low|medium|high, cmd_type: pure|read|write|delete|network|exec|unknown, reasons: [...]}`。
+  高危（`exec/eval/ctypes/win32*`）=可逃逸沙箱，L2 硬底线直接 deny，L3 沙箱再兜一层；中等（网络/执行/写/删除）=放行进沙箱并交给 L2 决策。
+
+  `cmd_type` 只用于展示/供人判断，**不参与放行决策**（放行判据是 L2 的 `safe_python` 白名单）：`pure`=所有调用都是已知纯函数（`print`/`len`… 或白名单纯计算模块）、`read`/`write`/`delete`/`network`/`exec` 按操作归类（`Path.read_text()` 这类拿不到接收者类型的链式调用按方法名归类）、`unknown`=有认不出的调用——它既不等于安全也不等于危险，只是没信息。
 
   `check_safety(code)` 是兼容旧接口，等价于 `classify()["risk"] != "high"`。
 
-  `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse`，以及 Linux 专属的 fork 炸弹 / `chmod -R 777 /` / `> /dev/sda` …）判 `high`，网络工具判 `medium`。
+  `classify_command(cmd)`（`cmd_check.py`）是 shell 命令版：对 `run_command` 的命令做风险分级，危险模式（`rm -rf`/`del`/`rd /s`/`format`/`mkfs`/`Remove-Item -Recurse`，以及 Linux 专属的 fork 炸弹 / `chmod -R 777 /` / `> /dev/sda` …）判 `high`，网络工具判 `medium`，删除类（`rm`/`rmdir`/`unlink`…）判 `medium`；`cmd_type` 同上是 `read|write|delete|network|exec|unknown`（跳过 `sudo`/`nohup` 等包装词看首词），同样只用于展示。
 - **L2 `PermissionSystem`** → 工具调用前决策 `allow/ask/deny`。
   
   顺序：readonly 工具放行 → 内置 deny 硬底线（危险命令 / AST 判 `high` 的代码，**用户规则无法放行**）→ 用户规则命中 → 默认姿态。
