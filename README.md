@@ -500,7 +500,7 @@ sessions/
 - **流式正文**：`Live + Markdown` 增量渲染，**粗体**/列表/代码块实时渲染；非流式回退时在 `done` 事件补打最终答案
 - **加载动画**：`step` 事件启动 `rich.status.Status(spinner="dots")` 显示 "agent thinking..."；收到第一个 chunk / tool_call / 错误等立刻停止（`transient=True` 不留残影）
 - **圆角 Banner**（仅 frontend）：`Panel(box=ROUNDED, border_style="cyan")` 显示 logo/mode/cwd/model/max_steps；会话信息（sid/steps/tokens/上次任务）放在 Panel 外；快捷提示精简为两行（模式前缀 + `/help`/`/exit`）
-- **彩色提示符**（仅 frontend）：`[sid] (mode) >`，sid 黄色、mode 绿色 ask / 红色 do / 蓝色 review。用 Rich markup 而非裸 ANSI，兼容 Windows PowerShell
+- **彩色提示符**（仅 frontend）：`[sid] (perm) (mode) >`，sid 黄色；perm 按严格程度取红黄绿（strict 绿 / balanced 黄 / yolo 红），mode 绿色 ask / 红色 do / 蓝色 review。perm 夹在 sid 与 mode 之间：mode 决定「能不能写」，perm 决定「要不要问」，`/mode`、`/perm` 运行时改的都是这两个值，提示符每轮重画即自动跟上。用 Rich markup 而非裸 ANSI，兼容 Windows PowerShell
 - **`/history` 角色彩色区分**：user `>` 青色、assistant `<` 品红、tool `#` 暗黄、system `*` dim；工具调用单独一行显示
 - **Rich markup `\[tag]` 转义**：所有字面方括号（`[session]`/`[history]` 等）用 `\[xxx]` 转义，避免被 Rich 误解析为 markup 标签而消失
 - **`file_diff` 渲染**：`write_file`/`delete_file` 覆盖模式自动生成 unified diff，用 `Syntax("diff")` + `Panel` 渲染给用户（LLM 不见，省 token）

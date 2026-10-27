@@ -47,7 +47,8 @@ from VilAgent.config import (
 )
 from VilAgent.i18n import t, set_lang, get_lang
 from VilAgent.input_line import read_line
-from VilAgent.safety import normalize_level, level_label, LEVEL_YOLO
+from VilAgent.safety import (normalize_level, level_label,
+                             LEVEL_STRICT, LEVEL_BALANCED, LEVEL_YOLO)
 
 
 # —— 常驻事件循环 ——
@@ -542,14 +543,20 @@ def repl_loop(model: AgentModel, view: TerminalView,
         getattr(args, "permission", None) or cfg.get("permission_level"))
 
     while True:
-        # 提示符：[sid] (mode) >
+        # 提示符：[sid] (perm) (mode) >
         # 用 Rich markup（Rich 内部处理 Windows ANSI）
         # 只放短 session ID：稳定、窄、不随标题长度抖动
+        # perm 放在 mode 左边：mode 决定「能不能写」，perm 决定「要不要问」，
+        # 两者都会被 /mode、/perm 在运行时改，重画提示符即可自动跟上
         mode_style = {"ask": "bold green", "do": "bold red",
                       "review": "bold blue"}.get(default_mode, "bold green")
+        # 红黄绿对应严格程度：strict 最紧（绿）、yolo 最松（红）
+        perm_style = {LEVEL_STRICT: "bold green", LEVEL_BALANCED: "bold yellow",
+                      LEVEL_YOLO: "bold red"}.get(perm_level, "bold yellow")
         prompt = (
             f"[bold cyan] Vil [/bold cyan]"
             f"[bold yellow]\\[{sid[:6]}][/bold yellow] "
+            f"[{perm_style}]({perm_level})[/{perm_style}] "
             f"[{mode_style}]({default_mode})[/{mode_style}] "
             f"[bold bright_black]>[/bold bright_black] "
         )
