@@ -19,7 +19,7 @@ import re
 from ..i18n import t
 
 __all__ = ["normalize_command", "match_dangerous_command", "classify_command",
-           "safe_command"]
+           "safe_command", "split_command_segments"]
 
 
 def normalize_command(cmd: str) -> str:
@@ -106,26 +106,36 @@ def classify_command(cmd: str) -> dict:
     return {"risk": "low", "cmd_type": ctype, "reasons": []}
 
 
-# ---- 「已证明只读且无法拼接」的命令判定（正向白名单，fail-closed）----
+# ---- 「已证明只读」的命令判定（正向白名单，fail-closed）----
 #
-# 注意：它**不再参与放行决策**（yolo 直接放行，balanced/strict 按工具类别决策），
-# 保留为可复用的证明器，供将来恢复「只自动放行只读命令」的中间层级、
-# 或用于审计/交叉验证黑名单口径。
+# 参与放行决策：permissions.evaluate() 在 balanced/strict 下用它把
+# 「只读探查命令」视同只读工具直接放行（yolo 本就全放行，不需要它）。
 #
 # 与 classify_command 的黑名单语义分开，理由同 ast_check.safe_python：
 #   classify_command().risk == "low"  → 「没发现危险」（展示/提示用）
-#   safe_command()                    → 「已证明只读且无法拼接」（正向证明）
+#   safe_command()                    → 「已证明只读」（正向证明）
 #
 # 比 Python 侧更严，因为 **run_command 完全不过沙箱**（sandbox 仅用于 run_python）：
 # L2 权限是它唯一的边界，一次误放行等于以当前用户身份直连执行。
 # 因此这里只收「只读探查」：任何可能写仓库、装依赖、联网或执行任意代码的命令
-# （python/pytest/npm/pip/curl/sed -i/tee…）都不在名单内。
+# （python/pytest/npm/pip/curl/sed -i/tee/find -exec/xargs…）都不在名单内。
 # 将来新增危险命令不必改这里：不在白名单里就天然不通过。
+#
+# `date` 刻意不在名单内：POSIX 无参数时只打印时间，但 Windows cmd 的 `date`
+# 是**交互式改系统日期**命令（PowerShell 下才等价于 Get-Date）。同一命令名
+# 跨平台语义相反时，只能按危险的一侧处理。
 SAFE_COMMANDS = frozenset({
     "ls", "dir", "pwd", "echo", "cat", "type", "head", "tail", "wc",
     "sort", "uniq", "grep", "findstr", "which", "where", "whoami",
-    "date", "uname", "more", "tree",
+    "uname", "more", "tree",
 })
+
+# 白名单命令里能写文件的参数：命令本身只读，选项却给了写出口 → 逐参数拦
+# （sort -o out.txt / tree -o out.txt 都是真的写盘，且不带 shell 元字符）
+_READONLY_CMD_WRITE_ARGS = {
+    "sort": ("-o", "--output"),
+    "tree": ("-o",),
+}
 
 # git 只放只读子命令
 SAFE_GIT_SUBCOMMANDS = frozenset({
@@ -143,9 +153,6 @@ _GIT_SUB_ALLOWED_ARGS = {
 # git 里能执行任意程序的参数（-c alias.x=!cmd、--exec-path、--output 写文件）
 _GIT_UNSAFE_ARGS = frozenset({"-c", "--exec-path", "--upload-pack",
                               "--output", "--ext-diff"})
-
-# shell 元字符：出现即可能拼接命令或重定向写文件 → 不放行
-_SHELL_META = (";", "&", "|", ">", "<", "$", "`", "(", ")", "\n", "\r")
 
 # —— classify_command 用的首词分类表（仅供展示，不参与放行判定）——
 # 删除类：不可逆，单独成档
@@ -241,11 +248,100 @@ def _command_type(cmd: str, dangerous_label: str | None) -> str:
     return "unknown"
 
 
+# 命令分隔符：长串在前，避免 `|` 抢先吃掉 `||`
+_CMD_SEPARATORS = ("&&", "||", "|", ";", "&")
+
+
+def split_command_segments(cmd: str) -> list[str] | None:
+    """按 shell 分隔符把命令切成若干段（引号内的分隔符不切）。
+
+    返回 None 表示**无法安全解析**，调用方必须按「未证明只读」处理：
+      - 重定向 `<` `>`、命令替换 `$` 和反引号、子 shell / 分块 `( ) { }`、换行
+      - 引号未闭合、双引号内的 `$` / 反引号展开
+    这些写法要么能写文件、要么要再套一层解释器才能算出真实命令，
+    静态证明的成本远高于收益，一律退回人工确认。
+
+    :param cmd: 原始命令字符串
+    :return: 各段命令的列表；无法安全解析时返回 None
+    """
+    s = str(cmd or "")
+    if not s.strip():
+        return None
+    segs: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif quote == '"' and ch in "$`":
+                return None          # 双引号内仍会做命令替换
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "$`(){}<>" or ch in "\n\r":
+            return None
+        sep = next((x for x in _CMD_SEPARATORS if s.startswith(x, i)), "")
+        if sep:
+            segs.append("".join(buf))
+            buf = []
+            i += len(sep)
+            continue
+        buf.append(ch)
+        i += 1
+    if quote:
+        return None
+    segs.append("".join(buf))
+    return [seg for seg in segs if seg.strip()] or None
+
+
+def _safe_single(raw: str) -> tuple[bool, str]:
+    """单段命令（已切掉分隔符）的只读证明"""
+    parts = raw.split()
+    if not parts:
+        return False, t("空命令段", "empty command segment")
+    exe = parts[0].lower().strip("'\"")
+    if not exe:
+        return False, t("空命令段", "empty command segment")
+    args = [p.strip("'\"") for p in parts[1:]]
+    if exe == "git":
+        return _safe_git(args)
+    if exe not in SAFE_COMMANDS:
+        return False, t(f"命令未列入只读白名单: {exe}",
+                        f"command not allowlisted as read-only: {exe}")
+    flags = _READONLY_CMD_WRITE_ARGS.get(exe)
+    if flags:
+        for arg in args:
+            low = arg.lower()
+            for f in flags:
+                if low.startswith("--"):
+                    # 长选项：--output / --output=x
+                    hit = low == f or low.startswith(f + "=")
+                elif low.startswith("-"):
+                    # 短选项可能合并书写（sort -ro out.txt == sort -r -o out.txt）
+                    hit = f[1:] in low[1:].split("=", 1)[0]
+                else:
+                    hit = False
+                if hit:
+                    return False, t(f"{exe} 的 {f} 参数会写文件",
+                                    f"{exe} {f} writes a file")
+    return True, t("只读探查命令", "read-only inspection command")
+
+
 def safe_command(cmd: str) -> tuple[bool, str]:
     """
-    正向判定：这条命令是否「已证明只读、且无法拼接」。
+    正向判定：这条命令是否「已证明只读」。
 
-    目前没有调用方，保留为可复用的证明器，见上方注释。
+    允许管道与顺序拼接，但要求**每一段**都单独通过只读证明：`ls | grep x`、
+    `git log | head` 通过，`ls && rm x` 因 rm 段不通过而拒绝。任一段无法解析
+    （重定向、命令替换、引号未闭合…）即整体拒绝——只要有一处说不清就不放行。
 
     :param cmd: shell 命令字符串
     :return: (是否通过证明, 说明)
@@ -253,18 +349,15 @@ def safe_command(cmd: str) -> tuple[bool, str]:
     raw = str(cmd or "")
     if not raw.strip():
         return False, t("空命令", "empty command")
-    if any(m in raw for m in _SHELL_META):
-        return False, t("命令含 shell 元字符（可拼接命令或重定向写文件）",
-                        "command contains shell metacharacters "
-                        "(can chain commands or redirect to files)")
-
-    parts = raw.split()
-    exe = parts[0].lower()
-    if exe == "git":
-        return _safe_git(parts[1:])
-    if exe not in SAFE_COMMANDS:
-        return False, t(f"命令未列入白名单: {exe}",
-                        f"command not allowlisted: {exe}")
+    segs = split_command_segments(raw)
+    if segs is None:
+        return False, t("命令无法静态证明只读（重定向/命令替换/引号不闭合）",
+                        "cannot statically prove read-only "
+                        "(redirection, command substitution or unbalanced quotes)")
+    for seg in segs:
+        ok, why = _safe_single(seg)
+        if not ok:
+            return False, why
     return True, t("只读探查命令", "read-only inspection command")
 
 

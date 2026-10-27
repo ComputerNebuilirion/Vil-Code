@@ -132,7 +132,8 @@ REPL 命令:
   /mode \\[ask|do|review]  查看/切换默认 mode
   /perm \\[strict|balanced|yolo]
                          查看/切换权限层级（strict=所有非只读都要确认，
-                         balanced=只有命令/删除类需确认，
+                         balanced=只有命令/删除类需确认；
+                         两者都直接放行只读命令 ls/cat/git status 等，
                          yolo=不做执行前检查，所有调用直接执行）
   /tokens                显示当前会话累计 token
   /title \\[force]         用 LLM 生成/重生成当前会话标题（/sessions 里显示）
@@ -212,9 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help=t(
                        "权限层级：strict=所有非只读操作都要确认；"
                        "balanced=只有命令/删除类操作需确认（默认）；"
+                       "两者都直接放行只读命令（ls/cat/git status 等，含只读管道）；"
                        "yolo=不做执行前检查，所有调用直接执行（auto 为旧别名）",
                        "permission level: strict=confirm every non-readonly action; "
                        "balanced=only command/delete actions need confirmation (default); "
+                       "both auto-pass read-only commands (ls/cat/git status, "
+                       "including read-only pipes); "
                        "yolo=no pre-execution checks, everything runs "
                        "(auto is a legacy alias)"))
     return p

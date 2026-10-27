@@ -1,7 +1,8 @@
 from .ast_check import (check_safety, classify, is_valid_python,
                         contains_unsafe_patterns, safe_python)
 from .cmd_check import (match_dangerous_command, classify_command,
-                        normalize_command, safe_command)
+                        normalize_command, safe_command,
+                        split_command_segments)
 from .sandbox import sandbox_run, clean_stale_sandboxes, child_utf8_env, decode_output
 from .permissions import (
     PermissionSystem, Rule, ALLOW, ASK, DENY,
@@ -33,6 +34,7 @@ __all__ = [
     "classify_command",
     "safe_python",
     "safe_command",
+    "split_command_segments",
     "match_dangerous_command",
     "normalize_command",
     "is_valid_python",

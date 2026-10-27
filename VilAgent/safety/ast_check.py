@@ -256,8 +256,10 @@ def safe_python(code: str) -> tuple[bool, str]:
     与 check_safety 的区别在于提问方向：check_safety 答「没发现危险」（黑名单），
     本函数答「已证明无逃逸路径」（白名单）。判不准一律返回 False。
 
-    目前没有调用方（yolo 层级不做执行前检查，其余层级按工具类别决策），
-    保留为可复用的证明器 + 黑名单的交叉验证对照，见上方注释。
+    目前没有调用方：命令侧的同构判据 `safe_command` 已作为 balanced/strict 的
+    只读命令白名单接入放行决策，但代码侧无法同等处理（任何 print 都可能触发
+    __repr__ 副作用，白名单模块集合也挡不住资源耗尽），故 run_python 仍需每次
+    确认。本函数保留为可复用的证明器 + 黑名单的交叉验证对照，见上方注释。
 
     :param code: Python 源码
     :return: (是否通过证明, 说明)

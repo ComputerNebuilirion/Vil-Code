@@ -31,8 +31,8 @@ DEFAULTS: dict = {
     # 输出语言：cn（中文）/ en（英文）；见 VilAgent/i18n.py
     "lang": "cn",
     # 权限层级（见 safety/permissions.py）：
-    #   strict   所有非只读操作都要用户确认
-    #   balanced 只有命令/代码执行 + 删除类工具需要确认（默认）
+    #   strict   所有非只读操作都要用户确认（只读命令如 ls/cat/git status 直接放行）
+    #   balanced 只有命令/代码执行 + 删除类工具需要确认（只读命令直接放行，默认）
     #   yolo     不做执行前检查，所有调用直接执行（仅保留灾难命令硬拦截）
     "permission_level": "balanced",
     # 需要用户确认 run_command 时，是否调一次模型总结该命令的目的（提示给人看）

@@ -331,17 +331,26 @@ def my_tool(foo: str, _ctx=None) -> str:
 
 | 层级 | 行为 | 适用 |
 |---|---|---|
-| `strict` | **所有非只读操作**都要人工确认（`write_file`/`edit_file` 也不例外） | 初次使用、审查陌生仓库 |
-| `balanced`（默认） | 写/编辑类工具 **allow**（低摩擦）；命令/代码执行类（`run_command`/`run_python`）**ask**；破坏性工具（`delete_file`）**ask** | 日常开发 |
+| `strict` | **所有非只读操作**都要人工确认（`write_file`/`edit_file` 也不例外）；只读命令直接放行 | 初次使用、审查陌生仓库 |
+| `balanced`（默认） | 写/编辑类工具 **allow**（低摩擦）；命令/代码执行类（`run_command`/`run_python`）**ask**；破坏性工具（`delete_file`）**ask**；只读命令直接放行 | 日常开发 |
 | `yolo` | **不做任何执行前检查**：除下面的 deny 硬底线与用户规则外，所有调用（含 `run_command`/`run_python`/`delete_file`）**直接 allow**，风险评级不参与决策 | 完全信任当前工作区与环境、追求无人值守 |
 
-  `run_command` / `run_python` 的 `risk=high` 在 `strict` / `balanced` 下都是 **deny**（内置硬底线，两工具同一口径：命令侧 `match_dangerous_command`、代码侧 `classify`），这两个层级只影响「默认姿态」中和 `medium` 及以下相关的部分；非 trust 模式（`ask`/`review`）写/执行一律 **deny**。用户规则文件与内置硬底线的优先级不变。
+  **只读命令白名单**（`strict` / `balanced` 下生效）：`run_command` 里「已证明只读」的命令视同只读工具**直接放行**，不弹确认框。判据是 `cmd_check.safe_command()` 的正向证明（fail-closed），不是风险评级——`risk=low` 只意味着「没发现危险」，`cat a.txt > b.txt` 也能判 low，不足以支撑放行。
+
+  - 放行：`ls` / `ls -la` / `cat a.txt` / `dir` / `pwd` / `echo hi` / `grep` / `findstr` / `head` / `tail` / `wc` / `sort` / `uniq` / `which` / `where` / `whoami` / `uname` / `tree` / `more`，以及 git 的 `status`/`log`/`diff`/`show`/`rev-parse`/`describe`/`ls-files`/`blame`/`shortlog`/`branch -l`/`remote -v`。
+  - **允许管道与顺序拼接，但要求每一段都单独通过证明**：`ls | grep x`、`git log | head -5`、`cat a.txt | sort | uniq` 放行；`ls && rm x` 因 `rm` 段不通过而拒绝（哪怕前半只读）。
+  - **任一处说不清就不放行**：重定向 `>` `<`（`cat a.txt > b.txt`）、命令替换 `$()` 与反引号（`echo $(whoami)`）、子 shell `( ) { }`、换行、引号不闭合 —— 这些要么能写文件、要么要再解一层解释器才能算出真实命令，一律退回人工确认。
+  - **只读命令的写选项逐参数拦**：`sort -o out.txt in.txt`、`sort --output=...`、`tree -o ...` 都不放行。
+  - **`date` 不在名单内**：POSIX 下无参数只打印时间，但 Windows cmd 的 `date` 是**交互式改系统日期**命令。同一命令名跨平台语义相反时，只能按危险的一侧处理。
+  - **用户规则优先于白名单**：规则文件里写 `{"tool":"run_command","pattern":"cat *","action":"ask"}` 仍能把 `cat` 拉回确认。白名单只是默认姿态的放松，不是旁路。
+
+  `run_command` / `run_python` 的 `risk=high` 在 `strict` / `balanced` 下都是 **deny**（内置硬底线，两工具同一口径：命令侧 `match_dangerous_command`、代码侧 `classify`），这两个层级只影响「默认姿态」中和 `medium` 及以下相关的部分；非 trust 模式（`ask`/`review`）写/执行一律 **deny**（只读命令与只读工具一样放行）。用户规则文件与内置硬底线的优先级不变。
 
   **`yolo` 的真实边界要说清楚**：它只保留两道闸——**deny 硬底线**（`rm -rf`/`del`/`mkfs`/fork 炸弹等灾难命令，`classify` 判 `high` 的代码）与**用户自己写进规则文件的 ask/deny**。除此之外不再有任何执行前检查，且 `run_command` **完全不经过沙箱**（L2 是它唯一边界），所以 agent 是以**你的用户权限**在执行，可写家目录、`~/.ssh`、任意挂载盘，不止当前工作区。`yolo` 会强制 `trust=True`（否则 `trust=False` 的默认姿态是「写/执行全 deny」，与该层级意图正相反）。两点实操细节：① 规则文件里的 `ask` 在 `yolo` 下仍会弹确认框，这是显式配置优先于默认姿态；② `rm -rf xxx`（哪怕目标只是工作区内的 `build/`）会被硬底线整条拒掉——要删目录请用 `delete_file` 工具，它走文件 API 而非 shell。
 
   历史名字 `auto` 仍可作为 `--permission` / `permission_level` 的取值，等价于 `yolo`（旧配置不会静默回退到 `balanced`）。
 
-  **`ast_check.safe_python` / `cmd_check.safe_command` 目前没有调用方**：它们原本是「auto 层级」的放行判据（正向白名单证明：`risk=low` 只意味着「**没发现**危险」，不足以支撑零确认执行），`yolo` 改成「不做执行前检查」后这条链路不再需要。两个函数保留下来作可复用的证明器（将来若要恢复「只自动放行纯计算/只读命令」的中间层级可直接接上）与黑名单的交叉验证对照，单测在 `tests/test_safe_autopass.py` 里照旧覆盖其 fail-closed 语义。
+  **`cmd_check.safe_command` 已接入放行决策**（上面「只读命令白名单」用的就是它）；**`ast_check.safe_python` 仍没有调用方**——纯计算的代码无法静态证明无害（任何 `print` 都能触发 `__repr__` 副作用，白名单模块集合也挡不住资源耗尽），所以 `run_python` 在 `strict`/`balanced` 下仍然每次都确认。两个函数都保持 fail-closed（判不准即不通过），单测在 `tests/test_safe_autopass.py` 里覆盖。
 
   **确认前的执行意图总结**：`run_command`（命令）或 `run_python`（代码）走到 ask 时，若 `permission_summary=true`（默认），会用**一次小模型调用**生成一两句话，说明「这一步想实现什么」（含当前任务与静态评级作上下文；`run_python` 还会带上沙箱工作目录和限额，因为同样的代码在 `workspace` 下会真实改动仓库、在 `sandbox` 下碰不到），塞进权限请求的 `summary` 字段并 emit `intent_summary` 事件，`TerminalView` 在确认框里以「意图: …」展示。只在**需要确认**时触发——放行/拒绝路径、`permission_summary=false`、或其他工具（如 `write_file`）都不会多花这次调用；总结失败/超时（15s）静默降级为空，不阻断确认流程，也不进对话历史。
 

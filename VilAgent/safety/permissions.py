@@ -9,6 +9,9 @@ per-action 权限评估就是安全边界。trust 控制默认姿态，规则文
   - 内置高危 deny 规则  → deny（硬底线，用户规则无法放行）
                           命令类=危险命令模式，代码类=AST 判 high（与 sandbox L1 同判据）
   - 用户规则命中        → 该规则的 action（可放松为 allow，也可收紧为 ask/deny）
+  - 只读命令            → allow（balanced/strict 下，`safe_command` 证明整条命令只读：
+                          ls / cat / dir / git status / ls | grep x 都算，
+                          见 cmd_check.SAFE_COMMANDS。yolo 本就全放行，不参与）
 层级（`level`，见 normalize_level）：
   - strict   → 所有非只读操作一律 ask（写/编辑也不例外，最保守）
   - balanced → 写/编辑类 allow；命令/代码执行类 ask；破坏性工具 ask（默认值）
@@ -32,7 +35,7 @@ from pathlib import Path
 
 from ..i18n import t
 from .ast_check import classify
-from .cmd_check import match_dangerous_command
+from .cmd_check import match_dangerous_command, safe_command
 
 ALLOW = "allow"
 ASK = "ask"
@@ -41,6 +44,7 @@ DENY = "deny"
 # —— 用户可选的权限层级（config: permission_level / CLI --permission / REPL /perm）——
 # strict   所有非只读操作都要人工确认（写/编辑也不例外）
 # balanced 只有命令/代码执行 + 破坏性操作要确认，写/编辑直接放行（默认）
+# 前两者都对「已证明只读」的 run_command 直接放行（见 safe_command）
 # yolo     不做任何执行前检查，所有工具调用直接执行（仅保留下面的 deny 硬底线）
 LEVEL_STRICT = "strict"
 LEVEL_BALANCED = "balanced"
@@ -67,14 +71,16 @@ def level_label(level) -> str:
     """层级的单行说明（给 /perm、banner 等人看）"""
     level = normalize_level(level)
     if level == LEVEL_STRICT:
-        return t("strict：所有非只读操作都要确认",
-                 "strict: confirm every non-readonly action")
+        return t("strict：非只读操作都要确认，只读命令直接放行",
+                 "strict: confirm every non-readonly action, "
+                 "read-only commands run directly")
     if level == LEVEL_YOLO:
         return t("yolo：不做执行前检查，所有调用直接执行（仅保留灾难命令硬拦截）",
                  "yolo: no pre-execution checks, every call runs directly "
                  "(only catastrophic-command guard remains)")
-    return t("balanced：只有命令/删除类操作需要确认",
-             "balanced: only command / delete actions need confirmation")
+    return t("balanced：只有命令/删除类操作需要确认（只读命令直接放行）",
+             "balanced: only command / delete actions need confirmation "
+             "(read-only commands run directly)")
 
 
 # 即使 trust=True 也仍需人工确认的「执行类」工具（其余非只读工具默认放行）
@@ -135,7 +141,8 @@ class PermissionSystem:
       1. readonly 工具 → allow
       2. 内置 deny 硬底线命中 → deny（用户规则无法放行）
       3. 用户规则命中（默认规则文件或显式传入的规则）→ 该规则的 action
-      4. 默认姿态（由 trust + level 共同决定）：
+      4. 只读命令（balanced/strict 下的 run_command）→ allow
+      5. 默认姿态（由 trust + level 共同决定）：
          - 非 trust（写/执行）     → deny
          - level=yolo             → allow（不做执行前检查，含执行/破坏类）
          - risk=high              → trust ? ask : deny
@@ -212,7 +219,16 @@ class PermissionSystem:
             if self._match(rule, tool_name, args):
                 return rule.action
 
-        # 4. 默认姿态
+        # 4. 只读命令白名单：balanced/strict 下把「已证明只读」的 run_command
+        #    视同只读工具直接放行（ls / cat / git status / ls | grep x …）。
+        #    放在用户规则之后 → 用户显式写的 ask/deny 规则仍然能收紧它；
+        #    yolo 无需判断（它本来就全放行）；门禁仍在第 2 步 deny 硬底线。
+        if tool_name == "run_command" and self.level != LEVEL_YOLO:
+            cmd = args.get("command")
+            if isinstance(cmd, str) and safe_command(cmd)[0]:
+                return ALLOW
+
+        # 5. 默认姿态
         if not self.trust:
             return DENY
         # 层级 3（yolo）：不做任何执行前检查 → 直接放行（含执行/破坏类）。
