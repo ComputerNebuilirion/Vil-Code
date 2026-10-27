@@ -446,6 +446,12 @@ class TerminalView:
             ans = await asyncio.to_thread(read_line, prompt_markup, console)
         except (EOFError, KeyboardInterrupt):
             console.print()
+            console.print(Text(t("  （输入已结束，按拒绝处理）",
+                                 "  (input closed => deny)"), style="dim"))
             return "deny"
         ans = ans.strip().lower()
+        if not ans:
+            console.print(Text(t("  （空输入，按拒绝处理）",
+                                 "  (empty input => deny)"), style="dim"))
+            return "deny"
         return "allow" if ans in ("y", "yes") else "deny"
